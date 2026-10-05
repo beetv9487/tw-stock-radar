@@ -11,6 +11,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 import streamlit as st
+import altair as alt
 
 APP_NAME = "我的台股雷達"
 TZ = timezone(timedelta(hours=8))            # 台灣時區 UTC+8
@@ -440,9 +441,11 @@ st.markdown(f"""
 # ---------- 輸入 ----------
 
 with st.form("query"):
+    # 用 key 讓輸入框自己記住內容；不要再用 value= 每次重設，
+    # 否則 Streamlit 會把它當成新元件重建，導致要按兩次才查得到
     code_input = st.text_input(
         "台股代碼",
-        value=st.session_state.get("code", ""),
+        key="code_input",
         placeholder="例如 2330",
         label_visibility="collapsed",
     )
@@ -544,11 +547,57 @@ st.markdown(card_html(
 
 # ---------- 走勢圖 ----------
 
-st.markdown("#### 📈 近一年走勢")
-chart = pd.DataFrame({"收盤價": hist["Close"]})
-chart["MA20"] = hist["Close"].rolling(20).mean()
-chart["MA60"] = hist["Close"].rolling(60).mean()
-st.line_chart(chart.tail(250))
+st.markdown("#### 📈 走勢圖")
+
+# 每個期間預設顯示的均線：短期看短均線、長期看長均線
+PERIODS = {
+    "3 個月": (63, ["MA5", "MA10", "MA20"]),
+    "1 年": (250, ["MA20", "MA60"]),
+}
+MA_LIST = ["MA5", "MA10", "MA20", "MA60", "MA120"]
+COLORS = {
+    "收盤價": "#f5fbff",
+    "MA5": "#ffd166",
+    "MA10": "#ff9b60",
+    "MA20": "#4ee3d0",
+    "MA60": "#b48cff",
+    "MA120": "#6f91ad",
+}
+
+# 讓切換按鈕和均線選單配合深藍色主題
+st.markdown("""
+<style>
+[data-testid="stRadio"] label p, [data-testid="stMultiSelect"] label p { color: #9db8cf !important; font-size: 13px; }
+[data-testid="stRadio"] [role="radiogroup"] { gap: 18px; }
+</style>
+""", unsafe_allow_html=True)
+
+period = st.radio("期間", list(PERIODS), horizontal=True,
+                  label_visibility="collapsed", key="chart_period")
+days, default_ma = PERIODS[period]
+picked = st.multiselect("顯示均線", MA_LIST, default=default_ma, key=f"ma_{period}")
+
+chart_df = pd.DataFrame({"收盤價": hist["Close"]})
+chart_df.index = pd.to_datetime(chart_df.index).tz_localize(None)   # 去掉時區，畫圖比較穩
+for n in (5, 10, 20, 60, 120):
+    chart_df[f"MA{n}"] = hist["Close"].rolling(n).mean().values
+
+lines = ["收盤價"] + [m for m in MA_LIST if m in picked]
+long_df = (chart_df[lines].tail(days).reset_index(names="日期")
+           .melt("日期", var_name="線", value_name="價格"))
+
+chart = alt.Chart(long_df).mark_line().encode(
+    x=alt.X("日期:T", title=None, axis=alt.Axis(format="%m/%d", labelColor="#7d9ab7", grid=False)),
+    y=alt.Y("價格:Q", title=None, scale=alt.Scale(zero=False),
+            axis=alt.Axis(labelColor="#7d9ab7", gridColor="rgba(105,150,185,.15)")),
+    color=alt.Color("線:N", sort=lines,
+                    scale=alt.Scale(domain=lines, range=[COLORS[l] for l in lines]),
+                    legend=alt.Legend(orient="top", title=None, labelColor="#cfe3f5")),
+    strokeWidth=alt.condition(alt.datum["線"] == "收盤價", alt.value(2.6), alt.value(1.4)),
+    tooltip=[alt.Tooltip("日期:T", format="%Y/%m/%d"), "線:N", alt.Tooltip("價格:Q", format=",.2f")],
+).properties(height=320).configure_view(strokeWidth=0).configure(background="transparent")
+
+st.altair_chart(chart, use_container_width=True)
 
 st.markdown("#### 📊 近半年成交量")
 st.bar_chart(hist["Volume"].tail(120))
