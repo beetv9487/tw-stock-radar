@@ -255,6 +255,20 @@ def cluster_levels(levels, tol=0.015):
     return groups
 
 
+# 近 14 天平均每日震盪幅度（ATR）
+def average_true_range(df, n=14):
+    h, l, c = df["High"], df["Low"], df["Close"]
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    return float(tr.rolling(n).mean().iloc[-1])
+
+
+# 現價上方最近的整數關卡（至少高 1%）
+def next_round(price):
+    for limit, step in [(10, 0.5), (50, 1), (100, 5), (500, 10), (1000, 50), (float("inf"), 100)]:
+        if price < limit:
+            return float(np.ceil(price * 1.01 / step) * step)
+
+
 def analyze(df, price):
     close = df["Close"]
 
@@ -287,6 +301,16 @@ def analyze(df, price):
     second_pressure = None
     if pressure:
         second_pressure = next((g for g in above if g["price"] > pressure["price"] * 1.02), None)
+
+    # 創新高、上方沒有歷史價位時 → 改用估算值
+    high_estimate = False
+    if pressure is None:
+        high_estimate = True
+        pressure = {"price": next_round(price), "sources": {"整數關卡"}, "strength": 1}
+    if second_pressure is None:
+        high_estimate = True
+        target = max(pressure["price"] * 1.02, price + 2 * average_true_range(df))
+        second_pressure = {"price": float(target), "sources": {"波動估算（2 倍 ATR）"}, "strength": 1}
 
     # ⚡ 關鍵突破：前 20 個交易日（不含今天）的最高價
     breakout = float(df["High"].iloc[-21:-1].max()) if len(df) > 21 else np.nan
@@ -338,6 +362,7 @@ def analyze(df, price):
         "vol_ratio": vol_ratio,
         "change_pct": change_pct,
         "score": score,
+        "high_estimate": high_estimate,
     }
 
 
@@ -512,7 +537,8 @@ st.markdown(card_html(
     "pressure", "orange-title", "🔵 壓力觀察",
     row_html("🔵 壓力共振區", a["pressure"], price)
     + row_html("🔥 第二壓力", a["second_pressure"], price),
-    "依據越多種（轉折、均線、量能），代表這個價位越多人關注。"
+    "股價已在近兩年高點之上，上方沒有歷史壓力，以上為估算參考值。" if a["high_estimate"]
+    else "依據越多種（轉折、均線、量能），代表這個價位越多人關注。"
 ), unsafe_allow_html=True)
 
 
