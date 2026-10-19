@@ -13,6 +13,8 @@ import yfinance as yf
 import streamlit as st
 import altair as alt
 
+import screener
+
 APP_NAME = "我的台股雷達"
 TZ = timezone(timedelta(hours=8))            # 台灣時區 UTC+8
 DB_PATH = Path(__file__).parent / "stock_radar.db"   # 資料庫放在 app.py 旁邊（Colab 和雲端都通用）
@@ -436,6 +438,29 @@ st.markdown(f"""
     <p>輸入台股代碼，看支撐、突破與壓力位置</p>
 </div>
 """, unsafe_allow_html=True)
+
+
+# ---------- 頁面切換：個股分析 / 選股 ----------
+
+PAGES = ["📊 個股分析", "🔎 選股"]
+
+# 從選股結果點了一檔 → 切到個股分析並帶入代碼（要在元件建立前改，所以放最前面）
+if "_goto" in st.session_state:
+    goto = st.session_state.pop("_goto")
+    st.session_state["page"] = PAGES[0]
+    st.session_state["code"] = goto
+    st.session_state["code_input"] = goto
+
+page = st.radio("頁面", PAGES, horizontal=True, label_visibility="collapsed", key="page")
+
+if page == PAGES[1]:
+    screener.render(metric_html)
+    st.markdown("""
+    <div class="warning">
+    選股結果只是依公開資料與公式篩選的參考名單，不構成任何投資建議。
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
 
 
 # ---------- 輸入 ----------
