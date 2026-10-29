@@ -753,6 +753,18 @@ def render(ins, name):
                 f'<div class="note">現價之下最接近的結構價位；跌破後結構轉弱。距現價超過 20% 的列在「長期結構」。</div></div>',
                 unsafe_allow_html=True)
 
+    # ---------- 關鍵突破：前 20 個交易日（不含今天）的最高價 ----------
+    bo = ins["hi20"]
+    if np.isfinite(bo):
+        bo_note = ("現價已站上前 20 日高點，突破近一個月的高點。" if price > bo
+                   else "站上這個價位，代表突破近一個月的高點。")
+        bo_html = (f'<div class="lv"><div class="lv-top">'
+                   f'<div><div class="lv-name">前 20 日最高價</div><div class="lv-sub">近一個月的高點</div></div>'
+                   f'<div class="lv-right"><div class="lv-price">{fmt_price(round_tick(bo))}</div>'
+                   f'<div class="lv-sub">距現價 {fmt_pct(pct(bo, price))}</div></div></div></div>')
+        st.markdown(f'<div class="card breakout"><div class="card-title blue-title">⚡ 關鍵突破</div>{bo_html}'
+                    f'<div class="note">{bo_note}</div></div>', unsafe_allow_html=True)
+
     # ---------- 壓力 ----------
     if s["p1"]:
         p_html = _level("⚡ 第一壓力", s["p1"], "現價上方 10% 以內最近的結構壓力。")
