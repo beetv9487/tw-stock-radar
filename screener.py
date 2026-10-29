@@ -82,27 +82,31 @@ def _pick_key(row, *keywords, exclude=()):
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _twse_foreign(day_str):
-    """上市某一天：{代號: (名稱, 外資買賣超股數)}。非交易日回 {}。"""
+    """上市某一天：{代號: (名稱, 外資買賣超股數, 投信買賣超股數)}。非交易日回 {}。"""
+    time.sleep(0.4)                        # 別打太快，避免被證交所暫時擋掉（有快取時不會執行）
     p = _get_json("https://www.twse.com.tw/rwd/zh/fund/T86",
                   {"date": day_str, "selectType": "ALLBUT0999", "response": "json"})
     rows = p.get("data") or []
     if not rows or p.get("stat") != "OK":
         return {}
     fields = p.get("fields") or []
-    # 第 4 欄：外陸資買賣超（不含外資自營商）；第 7 欄：外資自營商買賣超
-    if len(fields) < 8 or "買賣超" not in fields[4] or "外資自營商" not in fields[7]:
+    # 第 4 欄：外陸資買賣超（不含外資自營商）；第 7 欄：外資自營商買賣超；第 10 欄：投信買賣超
+    if (len(fields) < 11 or "買賣超" not in fields[4] or "外資自營商" not in fields[7]
+            or "投信" not in fields[10]):
         raise RuntimeError("證交所外資資料的欄位格式變了")
     out = {}
     for r in rows:
         code = _clean(r[0])
-        out[code] = (_clean(r[1]), np.nan_to_num(_num(r[4])) + np.nan_to_num(_num(r[7])))
+        out[code] = (_clean(r[1]), np.nan_to_num(_num(r[4])) + np.nan_to_num(_num(r[7])),
+                     np.nan_to_num(_num(r[10])))
     return out
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _tpex_foreign(day_str):
-    """上櫃某一天：{代號: (名稱, 外資買賣超股數)}。非交易日回 {}。"""
+    """上櫃某一天：{代號: (名稱, 外資買賣超股數, 投信買賣超股數)}。非交易日回 {}。"""
     d = datetime.strptime(day_str, "%Y%m%d")
+    time.sleep(0.4)
     p = _get_json("https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade",
                   {"type": "Daily", "sect": "EW", "date": d.strftime("%Y/%m/%d"),
                    "id": "", "response": "json"})
@@ -110,19 +114,19 @@ def _tpex_foreign(day_str):
     rows = (tables[0].get("data") if tables else None) or []
     if not rows:
         return {}
-    # 第 10 欄：外資及陸資合計買賣超
+    # 第 10 欄：外資及陸資合計買賣超；第 13 欄：投信買賣超
     out = {}
     for r in rows:
-        if len(r) < 11:
+        if len(r) < 14:
             continue
-        out[_clean(r[0])] = (_clean(r[1]), np.nan_to_num(_num(r[10])))
+        out[_clean(r[0])] = (_clean(r[1]), np.nan_to_num(_num(r[10])), np.nan_to_num(_num(r[13])))
     return out
 
 
 def recent_foreign(n_days, progress=None):
     """
     往回抓最近 n_days 個交易日的外資買賣超。
-    回傳 (dates, data)；data = {代號: {"name", "market", "nets": [最新, 前一天, ...]}}
+    回傳 (dates, data)；data = {代號: {"name", "market", "nets": [最新, 前一天, ...], "trust": [...]}}
     """
     today = datetime.now(TZ).date()
     dates, data = [], {}
@@ -138,13 +142,14 @@ def recent_foreign(n_days, progress=None):
                 idx = len(dates)
                 dates.append(day)
                 for market, src in (("上市", tw), ("上櫃", ot)):
-                    for code, (name, net) in src.items():
+                    for code, (name, net, trust) in src.items():
                         rec = data.setdefault(code, {"name": name, "market": market,
-                                                     "nets": [np.nan] * n_days})
+                                                     "nets": [np.nan] * n_days,
+                                                     "trust": [np.nan] * n_days})
                         rec["nets"][idx] = net
+                        rec["trust"][idx] = trust
                 if progress:
                     progress(len(dates) / n_days, f"外資資料：已抓 {len(dates)}/{n_days} 個交易日")
-                time.sleep(0.4)            # 別打太快，避免被證交所暫時擋掉
         day -= timedelta(days=1)
     return dates, data
 
@@ -169,6 +174,7 @@ def load_revenue():
         k_name = _pick_key(rows[0], "公司名稱") or _pick_key(rows[0], "CompanyName")
         k_ym = _pick_key(rows[0], "資料年月")
         k_yoy = _pick_key(rows[0], "去年同月增減")
+        k_mom = _pick_key(rows[0], "上月比較增減")
         if not (k_code and k_yoy):
             continue
         for r in rows:
@@ -176,6 +182,7 @@ def load_revenue():
                 "name": str(r.get(k_name, "")).strip() if k_name else "",
                 "ym": str(r.get(k_ym, "")).strip() if k_ym else "",
                 "yoy": _num(r.get(k_yoy)),
+                "mom": _num(r.get(k_mom)) if k_mom else np.nan,
             }
     return out
 
