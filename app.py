@@ -3,6 +3,7 @@
 # ============================================================
 
 import sqlite3
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -204,20 +205,28 @@ def realtime(code):
 # ---------- 歷史日 K（Yahoo Finance） ----------
 
 # 近 2 年日 K，快取 10 分鐘；先試上市 .TW，再試上櫃 .TWO
+# 抓不到時丟出錯誤（不是回傳 None），這樣失敗結果不會被快取住，下次按會重抓
 @st.cache_data(ttl=600)
-def get_history(code):
-    for suffix in [".TW", ".TWO"]:
-        try:
-            df = yf.Ticker(f"{code}{suffix}").history(
-                period="2y", interval="1d", auto_adjust=False
-            )
-            if df is not None and not df.empty:
-                df = df.dropna(subset=["Close"])
-                return df
-        except Exception:
-            pass
+def _history_cached(code):
+    for attempt in range(2):                 # Yahoo 偶爾會暫時擋，多試一次
+        for suffix in [".TW", ".TWO"]:
+            try:
+                df = yf.Ticker(f"{code}{suffix}").history(
+                    period="2y", interval="1d", auto_adjust=False
+                )
+                if df is not None and not df.empty:
+                    return df.dropna(subset=["Close"])
+            except Exception:
+                pass
+        time.sleep(1)
+    raise LookupError(f"抓不到 {code} 的歷史資料")
 
-    return None
+
+def get_history(code):
+    try:
+        return _history_cached(code)
+    except Exception:
+        return None
 # ============================================================
 # 第 2-3 格：技術分析（支撐／壓力／突破／趨勢／成交量／評分）
 # ============================================================
