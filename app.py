@@ -14,6 +14,7 @@ import streamlit as st
 import altair as alt
 
 import screener
+import insights
 
 APP_NAME = "我的台股雷達"
 TZ = timezone(timedelta(hours=8))            # 台灣時區 UTC+8
@@ -510,6 +511,15 @@ else:
 
 a = analyze(hist, price)
 
+# 深入分析（結構價位、評分、籌碼、估值…）；支撐壓力與評分改用這裡的結果
+with st.spinner("整理法人、籌碼與基本面資料…"):
+    ins = insights.build(code, hist, price)
+_s = ins["struct"]
+a["near_support"], a["second_support"] = _s["s1"], _s["s2"]
+a["pressure"], a["second_pressure"] = _s["p1"] or _s["mid_p"], _s["p2"]
+if ins["total"] is not None:
+    a["score"] = ins["total"]
+
 # 只有按下按鈕時才存一筆，避免畫面每次重整都重複存
 if submitted:
     save_analysis(code, a)
@@ -525,49 +535,9 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# ---------- 小指標 ----------
+# ---------- 深入分析：評分、重點整理、今天為什麼動、位置、支撐壓力、研究室 ----------
 
-chg = a["change_pct"]
-chg_text = f"{chg:+.2f}%" if np.isfinite(chg) else "—"
-vol_text = f'{a["vol_ratio"]:.2f} 倍' if np.isfinite(a["vol_ratio"]) else "—"
-
-c1, c2, c3, c4 = st.columns(4)
-c1.markdown(metric_html("漲跌幅", chg_text), unsafe_allow_html=True)
-c2.markdown(metric_html("📊 趨勢", a["trend"]), unsafe_allow_html=True)
-c3.markdown(metric_html("📊 量比（對 20 日均量）", vol_text), unsafe_allow_html=True)
-c4.markdown(metric_html("參考評分", f'{a["score"]} / 100'), unsafe_allow_html=True)
-
-
-# ---------- 🛡️ 支撐觀察 ----------
-
-st.markdown(card_html(
-    "support", "green-title", "🛡️ 支撐觀察",
-    row_html("🟢 近端支撐", a["near_support"], price)
-    + row_html("🟢 第二近端支撐", a["second_support"], price),
-    "跌破近端支撐，下一個觀察點是第二支撐。"
-), unsafe_allow_html=True)
-
-
-# ---------- ⚡ 關鍵突破 ----------
-
-bo = a["breakout"]
-bo_note = "現價已站上前 20 日高點。" if np.isfinite(bo) and price > bo else "站上這個價位，代表突破近一個月的高點。"
-st.markdown(card_html(
-    "breakout", "blue-title", "⚡ 關鍵突破",
-    row_html("前 20 日最高價", bo, price, sub="近一個月的高點"),
-    bo_note
-), unsafe_allow_html=True)
-
-
-# ---------- 🔵 壓力 ----------
-
-st.markdown(card_html(
-    "pressure", "orange-title", "🔵 壓力觀察",
-    row_html("🔵 壓力共振區", a["pressure"], price)
-    + row_html("🔥 第二壓力", a["second_pressure"], price),
-    "股價已在近兩年高點之上，上方沒有歷史壓力，以上為估算參考值。" if a["high_estimate"]
-    else "依據越多種（轉折、均線、量能），代表這個價位越多人關注。"
-), unsafe_allow_html=True)
+insights.render(ins, name)
 
 
 # ---------- 走勢圖 ----------
