@@ -6,11 +6,11 @@
 #   2. 獲利穩定、每股盈餘（EPS）大致往上
 #   3. 負債不高
 #   4. 毛利率高又穩（護城河的痕跡）
-#   5. 賺的是真現金（自由現金流）
+#   5. 賺的是真現金（股東盈餘＝營業現金流 − 維持性資本支出）
 #   6. 價格低於估算的內在價值（安全邊際）
 #
-# 資料：FinMind 的季度損益表、資產負債表、現金流量表（近 7 年）。
-# 只用「完整 4 季」的年度；金融股的報表結構不同，只評 ROE 與獲利穩定。
+# 資料：FinMind 的季度損益表、資產負債表、現金流量表（近 12 年）。
+# 只用「完整 4 季」的年度；金融股的報表結構不同，改評 ROE、獲利穩定、淨值比估值。
 # 這是把原則寫成公式的參考，不是巴菲特本人的看法，也不構成投資建議。
 # ============================================================
 
@@ -32,6 +32,8 @@ DISCOUNT = 0.10        # 折現率 10%
 TERMINAL_G = 0.025     # 10 年後的永續成長率
 MAX_G = 0.10           # 前 10 年成長率上限
 YEARS = 10
+FIN_REQUIRED = 0.10    # 金融股：股東要求報酬率（推算合理淨值比用）
+MIN_COVER = 50         # 有資料的項目配分合計至少 50 分才打分，避免只剩一兩項就變滿分
 
 
 # ------------------------------------------------------------
@@ -70,7 +72,7 @@ def _fetch(dataset, code, start):
 # 抓不到時丟出錯誤，這樣失敗結果不會被快取住
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def _load(code):
-    start = f"{datetime.now(TZ).year - 7}-01-01"
+    start = f"{datetime.now(TZ).year - 12}-01-01"      # 葛拉漢要 10 年
     inc = _fetch("TaiwanStockFinancialStatements", code, start)
     if inc.empty:
         raise LookupError("沒有財報資料")
@@ -91,6 +93,19 @@ def _wide(df):
     return df.pivot_table(index="date", columns="type", values="value", aggfunc="last")
 
 
+# 淨利的科目名稱：一般公司 vs 金融業（IncomeAfterTax 少一個 s）
+NI_NAMES = ("EquityAttributableToOwnersOfParent", "IncomeAfterTaxes", "IncomeAfterTax",
+            "TotalConsolidatedProfitForThePeriod")
+
+
+def _sum_cols(df, *names):
+    """幾個科目加總；全部都沒有才是缺值"""
+    cols = [df[n] for n in names if n in df.columns]
+    if not cols:
+        return pd.Series(np.nan, index=df.index)
+    return pd.concat(cols, axis=1).sum(axis=1, min_count=1)
+
+
 def _col(df, *names):
     for n in names:
         if n in df.columns:
@@ -108,7 +123,7 @@ def annual(inc, bs, cf):
         "revenue": _col(q, "Revenue"),
         "gross": _col(q, "GrossProfit"),
         "op": _col(q, "OperatingIncome"),
-        "ni": _col(q, "EquityAttributableToOwnersOfParent", "IncomeAfterTaxes"),
+        "ni": _col(q, *NI_NAMES),
         "eps": _col(q, "EPS"),
     })
     q["year"] = q.index.year
@@ -125,8 +140,11 @@ def annual(inc, bs, cf):
         b.index = b.index.year
         y["equity"] = _col(b, "EquityAttributableToOwnersOfParent", "Equity").reindex(y.index)
         y["liab"] = _col(b, "Liabilities").reindex(y.index)
+        # 有息負債＝短期借款＋長期借款＋應付公司債（應付帳款這類不用付利息的不算）
+        y["debt"] = _sum_cols(b, "ShorttermBorrowings", "LongtermBorrowings", "BondsPayable").reindex(y.index)
+        y["cash"] = _col(b, "CashAndCashEquivalents").reindex(y.index)
     else:
-        y["equity"] = y["liab"] = np.nan
+        y["equity"] = y["liab"] = y["debt"] = y["cash"] = np.nan
 
     # 現金流量表是「年初累計」，所以 12/31 那筆就是全年
     c = _wide(cf)
@@ -136,10 +154,15 @@ def annual(inc, bs, cf):
         c.index = c.index.year
         y["ocf"] = _col(c, "CashFlowsFromOperatingActivities", "NetCashInflowFromOperatingActivities").reindex(y.index)
         y["capex"] = _col(c, "PropertyAndPlantAndEquipment").reindex(y.index)   # 負數＝買設備
+        y["dep"] = _sum_cols(c, "Depreciation", "AmortizationExpense").reindex(y.index)
     else:
-        y["ocf"] = y["capex"] = np.nan
+        y["ocf"] = y["capex"] = y["dep"] = np.nan
 
     y["fcf"] = y["ocf"] + y["capex"]
+    # 股東盈餘（巴菲特 1986 年股東信）：只扣「維持營運」的資本支出，擴廠的錢不扣。
+    # 維持性支出用折舊攤銷估計（買設備的錢若比折舊少，就用實際金額）。
+    maint = np.minimum((-y["capex"]).clip(lower=0), y["dep"])
+    y["oe"] = (y["ocf"] - maint).where(maint.notna(), y["fcf"])
     y["roe"] = y["ni"] / y["equity"] * 100
     y["gm"] = y["gross"] / y["revenue"] * 100
     y["opm"] = y["op"] / y["revenue"] * 100
@@ -158,19 +181,29 @@ def _cagr(first, last, years):
     return (last / first) ** (1 / years) - 1
 
 
-def intrinsic_value(y):
-    """回傳 (每股內在價值, 說明dict)；資料不夠回傳 (nan, {})"""
-    recent = y.tail(3)
-    fcf = recent["fcf"].dropna()
-    shares = y["shares"].dropna()
-    if len(fcf) < 2 or shares.empty or shares.iloc[-1] <= 0:
-        return np.nan, {}
-    base = fcf.mean() / shares.iloc[-1]          # 近 3 年平均每股自由現金流
-    if not np.isfinite(base) or base <= 0:
-        return np.nan, {"base": base}
+def eps_growth(eps):
+    """EPS 年成長率（對數迴歸的斜率），比只看頭尾兩年穩；有虧損年度回傳 nan"""
+    e = eps.dropna()
+    if len(e) < 3 or (e <= 0).any():
+        return np.nan
+    x = np.arange(len(e), dtype=float)
+    slope = np.polyfit(x, np.log(e.values.astype(float)), 1)[0]
+    return float(np.exp(slope) - 1)
+
+
+def intrinsic_value(y, y_long=None):
+    """回傳 (每股內在價值, 說明dict)；資料不夠回傳 (nan, {})。y_long：景氣循環股用的較長年度"""
     eps = y["eps"].dropna()
-    g = _cagr(eps.iloc[0], eps.iloc[-1], len(eps) - 1) if len(eps) >= 3 else np.nan
     cyclical = eps_cv(eps) > 0.6
+    # 一般公司看近 3 年；景氣循環股看整個循環（最多 10 年）的平均，避免剛好用到景氣高峰
+    oe = ((y_long if y_long is not None else y) if cyclical else y.tail(3))["oe"].dropna()
+    shares = y["shares"].dropna()
+    if len(oe) < 2 or shares.empty or shares.iloc[-1] <= 0:
+        return np.nan, {}
+    base = oe.mean() / shares.iloc[-1]           # 平均每股股東盈餘
+    if not np.isfinite(base) or base <= 0:
+        return np.nan, {"base": base, "cyclical": cyclical, "n": len(oe)}
+    g = eps_growth(eps)
     g_used = 0.0 if cyclical else float(min(max(g if np.isfinite(g) else 0.0, 0.0), MAX_G))
 
     pv, cash = 0.0, base
@@ -179,7 +212,7 @@ def intrinsic_value(y):
         pv += cash / (1 + DISCOUNT) ** t
     terminal = cash * (1 + TERMINAL_G) / (DISCOUNT - TERMINAL_G)
     pv += terminal / (1 + DISCOUNT) ** YEARS
-    return float(pv), {"base": float(base), "g": g, "g_used": g_used, "cyclical": cyclical}
+    return float(pv), {"base": float(base), "g": g, "g_used": g_used, "cyclical": cyclical, "n": len(oe)}
 
 
 def eps_cv(eps):
@@ -199,7 +232,10 @@ def _pass(points, text):
     return (text, int(points))
 
 
-def evaluate(y, price):
+CYCLE_CAP = 45     # 獲利不穩定（景氣循環、曾虧損）時的總分上限
+
+
+def evaluate(y, price, y_long=None):
     is_fin = bool(y["gross"].isna().all() and (y["de"].dropna() > 5).any())
     sections = {}
 
@@ -232,18 +268,35 @@ def evaluate(y, price):
     sections["獲利穩定"] = (r, 15)
 
     if is_fin:
+        # 金融業：負債就是生意本身（存款、保單），沒有毛利、資本支出，改用淨值比估值
         sections["負債"] = ([], 15)
         sections["護城河"] = ([], 15)
         sections["現金流"] = ([], 15)
-        sections["安全邊際"] = ([], 15)
         iv, info = np.nan, {}
-    else:
-        # 3. 負債（15 分）
-        de = y["de"].dropna()
         r = []
-        if len(de):
-            d = de.iloc[-1]
-            r.append(_pass(15 if d < 0.5 else 8 if d < 1 else 0, f"負債／股東權益 {d:.2f} 倍"))
+        eq, sh = y["equity"].dropna(), y["shares"].dropna()
+        if len(roe) >= 3 and len(eq) and len(sh) and sh.iloc[-1] > 0 and np.isfinite(price):
+            bvps = eq.iloc[-1] / sh.iloc[-1]
+            pb = price / bvps
+            fair = roe.mean() / 100 / FIN_REQUIRED      # ROE 10% 的銀行，合理淨值比約 1 倍
+            pts = 15 if pb <= fair * 0.7 else 8 if pb <= fair else 0
+            r.append(_pass(pts, f"股價淨值比 {pb:.2f} 倍；以平均 ROE {roe.mean():.1f}% 推算合理約 {fair:.2f} 倍"
+                                f"（假設股東要求 {FIN_REQUIRED * 100:.0f}% 報酬，低於合理值 30% 以上才有安全邊際）"))
+        sections["安全邊際"] = (r, 15)
+    else:
+        # 3. 負債（15 分）：有息負債（借款＋公司債）÷ 股東權益
+        last = y.iloc[-1]
+        r = []
+        if np.isfinite(last["equity"]) and last["equity"] > 0:
+            debt = last["debt"] if np.isfinite(last["debt"]) else 0.0
+            d = debt / last["equity"]
+            cash = last["cash"]
+            net_cash = np.isfinite(cash) and cash >= debt
+            pts = 15 if (d <= 0.3 or net_cash) else 8 if d <= 0.6 else 0
+            txt = f"有息負債（借款＋公司債）÷ 股東權益 {d:.2f} 倍"
+            if net_cash:
+                txt += f"；現金 {cash / 1e8:,.0f} 億 ≥ 有息負債 {debt / 1e8:,.0f} 億（淨現金）"
+            r.append(_pass(pts, txt))
         sections["負債"] = (r, 15)
 
         # 4. 護城河：毛利率高又穩（15 分）
@@ -257,36 +310,44 @@ def evaluate(y, price):
                 r.append(_pass(5 if sd <= 3 and avg >= 25 else 0, f"毛利率波動 ±{sd:.1f} 個百分點"))
         sections["護城河"] = (r, 15)
 
-        # 5. 現金流（15 分）
-        f = y[["fcf", "ni"]].dropna()
+        # 5. 現金流（15 分）：股東盈餘
+        f = y[["oe", "ni"]].dropna()
         r = []
         if len(f):
-            pos = int((f["fcf"] > 0).sum())
-            r.append(_pass(10 if pos >= 0.8 * len(f) else 0, f"{len(f)} 年中 {pos} 年自由現金流為正"))
-            conv = f["fcf"].sum() / f["ni"].sum() if f["ni"].sum() > 0 else np.nan
+            pos = int((f["oe"] > 0).sum())
+            r.append(_pass(10 if pos >= 0.8 * len(f) else 0, f"{len(f)} 年中 {pos} 年股東盈餘為正"))
+            conv = f["oe"].sum() / f["ni"].sum() if f["ni"].sum() > 0 else np.nan
             if np.isfinite(conv):
-                r.append(_pass(5 if conv >= 0.8 else 0, f"自由現金流／淨利 {conv:.2f} 倍"))
+                r.append(_pass(5 if conv >= 0.8 else 0, f"股東盈餘／淨利 {conv:.2f} 倍（賺的是不是真現金）"))
         sections["現金流"] = (r, 15)
 
         # 6. 安全邊際（15 分）
-        iv, info = intrinsic_value(y)
+        iv, info = intrinsic_value(y, y_long)
         r = []
         if np.isfinite(iv) and iv > 0 and np.isfinite(price):
             mos = (iv - price) / iv * 100
             pts = 15 if mos >= 30 else 8 if mos >= 10 else 3 if mos >= 0 else 0
             r.append(_pass(pts, f"安全邊際 {mos:+.0f}%（內在價值 {fmt_price(iv)}）"))
         elif info.get("base") is not None and info["base"] <= 0:
-            r.append(_pass(0, "近 3 年平均自由現金流為負，無法估內在價值"))
+            r.append(_pass(0, f"近 {info.get('n', 3)} 年平均股東盈餘為負，無法估內在價值"))
         sections["安全邊際"] = (r, 15)
 
     have = {k: v for k, v in sections.items() if v[0]}
-    if not have:
+    full = sum(w for _, (_, w) in have.items())
+    if full < MIN_COVER:      # 能評的項目太少，分數會失真 → 不給分
         return None
     got = sum(p for k, (rules, _) in have.items() for _, p in rules)
-    full = sum(w for _, (_, w) in have.items())
     score = int(round(got / full * 100))
+    # 巴菲特收購條件第 2 條：要「穩定的獲利能力」，不碰轉機股 → 獲利大起大落或曾虧損，總分最多 45
+    cv = eps_cv(eps)
+    unstable = len(eps) >= 3 and ((eps <= 0).any() or not np.isfinite(cv) or cv > 0.6)
+    cap_note = ""
+    if unstable and score > CYCLE_CAP:
+        cap_note = (f"獲利大起大落或曾虧損：巴菲特只買「獲利能力穩定」的公司（收購條件第 2 條），"
+                    f"所以總分最多 {CYCLE_CAP}（未設上限時是 {score} 分）。")
+        score = CYCLE_CAP
     return {"score": score, "sections": sections, "is_fin": is_fin, "iv": iv, "iv_info": info,
-            "years": list(y.index), "y": y}
+            "years": list(y.index), "y": y, "cap_note": cap_note}
 
 
 def verdict(score):
@@ -303,7 +364,7 @@ def build(code, price):
     y = annual(inc, bs, cf)
     if len(y) < 3:
         return None
-    return evaluate(y.tail(6), price)
+    return evaluate(y.tail(6), price, y.tail(10))
 
 
 # ------------------------------------------------------------
@@ -325,14 +386,14 @@ def render(code, price):
     rows = []
     for k, (rules, w) in secs.items():
         got = sum(p for _, p in rules)
-        val = f"{got}／{w}" if rules else "不適用" if b["is_fin"] and k not in ("ROE", "獲利穩定") else "—"
+        val = f"{got}／{w}" if rules else "不適用" if b["is_fin"] and k in ("負債", "護城河", "現金流") else "—"
         pctw = got / w * 100 if rules else 0
         rows.append(f'<div class="bar-row"><span class="name">{_e(k)}</span><div class="track">'
                     f'<div class="fill" style="width:{pctw:.0f}%"></div></div>'
                     f'<span class="val" style="width:58px">{val}</span></div>')
     yrs = b["years"]
-    fin_note = ("<br>金融股的報表沒有毛利、資本支出，負債比也不能用一般標準看，所以只評 ROE 與獲利穩定，"
-                "分數只用這兩項換算。" if b["is_fin"] else "")
+    fin_note = ("<br>金融股的報表沒有毛利、資本支出，負債比也不能用一般標準看，所以改評 ROE、獲利穩定與淨值比估值，"
+                "分數用這三項換算。" if b["is_fin"] else "")
     st.markdown(f"""
     <div class="ins-card">
       <div class="score-wrap">
@@ -357,6 +418,8 @@ def rules_block(secs):
 
 
 def detail(b):
+    if b.get("cap_note"):
+        st.caption("⚠️ " + b["cap_note"])
     rules_block(b["sections"])
 
     y = b["y"]
@@ -365,8 +428,8 @@ def detail(b):
         "ROE%": y["roe"].round(1),
         "EPS": y["eps"].round(2),
         "毛利率%": y["gm"].round(1),
-        "負債/權益": y["de"].round(2),
-        "自由現金流(億)": (y["fcf"] / 1e8).round(0),
+        "有息負債/權益": (y["debt"].fillna(0) / y["equity"]).round(2),
+        "股東盈餘(億)": (y["oe"] / 1e8).round(0),
     })
     st.dataframe(tbl, hide_index=True, width="stretch")
 
@@ -374,14 +437,14 @@ def detail(b):
     if np.isfinite(b["iv"]):
         g = info.get("g")
         if info.get("cyclical"):
-            st.caption(f"內在價值估法：近 3 年平均每股自由現金流 {info['base']:.2f} 元；"
-                       "獲利大起大落，不假設未來會成長。景氣循環股的現金流會隨景氣大幅變動，這個估計特別不可靠。")
+            st.caption(f"內在價值估法：獲利大起大落（景氣循環），改用近 {info.get('n', '')} 年整個循環的平均每股股東盈餘 "
+                       f"{info['base']:.2f} 元，且不假設未來會成長。景氣循環股的現金流變動大，這個估計特別不可靠。")
         else:
             st.caption(
-                f"內在價值估法：近 3 年平均每股自由現金流 {info['base']:.2f} 元，"
+                f"內在價值估法：近 3 年平均每股股東盈餘 {info['base']:.2f} 元，"
                 f"前 {YEARS} 年每年成長 {info['g_used'] * 100:.1f}%"
                 f"（EPS 歷史年成長 {g * 100:.1f}%，上限 {MAX_G * 100:.0f}%）" if np.isfinite(g) else
-                f"內在價值估法：近 3 年平均每股自由現金流 {info['base']:.2f} 元，假設不成長"
+                f"內在價值估法：近 3 年平均每股股東盈餘 {info['base']:.2f} 元，假設不成長"
             )
-        st.caption(f"折現率 {DISCOUNT * 100:.0f}%、永續成長 {TERMINAL_G * 100:.1f}%。"
-                   "正在大量擴廠的公司，自由現金流會被資本支出壓低，內在價值容易低估。")
+        st.caption(f"股東盈餘＝營業現金流 − 維持性資本支出（用折舊攤銷估計，擴廠的錢不扣）。"
+                   f"折現率 {DISCOUNT * 100:.0f}%、永續成長 {TERMINAL_G * 100:.1f}%。")
