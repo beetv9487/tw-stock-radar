@@ -19,7 +19,7 @@ import streamlit as st
 import yfinance as yf
 
 import buffett
-from buffett import _wide, _col, _cagr, annual, verdict
+from buffett import _wide, _col, annual, verdict, eps_growth, NI_NAMES, MIN_COVER
 from insights import _e, fmt_price
 
 TZ = timezone(timedelta(hours=8))
@@ -32,7 +32,7 @@ TZ = timezone(timedelta(hours=8))
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def _dividends(code):
     """每年發的股利（現金＋股票，元／股），用除權息資料日期的年份分組"""
-    start = f"{datetime.now(TZ).year - 8}-01-01"
+    start = f"{datetime.now(TZ).year - 21}-01-01"      # 葛拉漢要 20 年配息紀錄
     d = buffett.fetch_rows("TaiwanStockDividend", code, start)
     return dividend_years(d)
 
@@ -99,7 +99,7 @@ def quarters(inc):
     q.index = pd.to_datetime(q.index)
     return pd.DataFrame({
         "revenue": _col(q, "Revenue"),
-        "ni": _col(q, "EquityAttributableToOwnersOfParent", "IncomeAfterTaxes"),
+        "ni": _col(q, *NI_NAMES),
         "eps": _col(q, "EPS"),
     }).sort_index()
 
@@ -160,10 +160,10 @@ def is_financial(y):
 
 def _finish(sections, cap=None, cap_note="", **extra):
     have = {k: v for k, v in sections.items() if v[0]}
-    if not have:
+    full = sum(w for _, (_, w) in have.items())
+    if full < MIN_COVER:      # 能評的項目太少，分數會失真 → 不給分
         return None
     got = sum(p for _, (rules, _) in have.items() for _, p in rules)
-    full = sum(w for _, (_, w) in have.items())
     score = int(round(got / full * 100))
     capped = cap is not None and score > cap
     return {"score": min(score, cap) if capped else score, "raw_score": score, "sections": sections,
@@ -171,8 +171,12 @@ def _finish(sections, cap=None, cap_note="", **extra):
 
 
 # ------------------------------------------------------------
-# 📘 葛拉漢：防禦型投資人的七個條件
+# 📘 葛拉漢：防禦型投資人的七個條件（《智慧型股票投資人》第 14 章）
+#   10 年年年獲利、20 年不中斷配息、10 年盈餘成長 1/3 以上（頭尾各取 3 年平均）、
+#   本益比 ≤ 15（近 3 年平均 EPS）、淨值比 ≤ 1.5 或 本益比×淨值比 ≤ 22.5
 # ------------------------------------------------------------
+
+DIV_DATA_START = 2010      # FinMind 股利資料 2009 年前有缺漏（例如台積電 2009 年有配息卻查不到），從 2010 起算
 
 def graham(y, q, b, divy, price, fin):
     s = {}
@@ -193,13 +197,16 @@ def graham(y, q, b, divy, price, fin):
             r.append((f"股價 ÷ 近 3 年平均 EPS = {pe:.1f} 倍（標準 ≤ 15）", 20 if pe <= 15 else 8 if pe <= 20 else 0))
     s["本益比"] = (r, 20)
 
-    # 2. 股價淨值比（20）：≤ 1.5，或 本益比 × 淨值比 ≤ 22.5
+    # 2. 股價淨值比（20）：≤ 1.5，或 本益比 × 淨值比 ≤ 22.5（本益比夠低時，淨值比可以高一點；兩者過一個就算過）
     r, pb = [], np.nan
     if np.isfinite(bvps) and bvps > 0:
         pb = price / bvps
-        r.append((f"股價淨值比 {pb:.2f} 倍（標準 ≤ 1.5）", 10 if pb <= 1.5 else 0))
-        if np.isfinite(pe):
-            r.append((f"本益比 × 淨值比 = {pe * pb:.1f}（標準 ≤ 22.5）", 10 if pe * pb <= 22.5 else 0))
+        prod = pe * pb if np.isfinite(pe) else np.nan
+        ok = pb <= 1.5 or (np.isfinite(prod) and prod <= 22.5)
+        txt = f"股價淨值比 {pb:.2f} 倍（≤ 1.5）"
+        if np.isfinite(prod):
+            txt += f"、本益比 × 淨值比 {prod:.1f}（≤ 22.5）"
+        r.append((txt + "：兩者過一個就算過", 20 if ok else 0))
     elif np.isfinite(bvps):
         r.append(("每股淨值為負，不符合", 0))
     s["股價淨值比"] = (r, 20)
@@ -217,29 +224,36 @@ def graham(y, q, b, divy, price, fin):
                       10 if ltd <= wc else 0))
     s["財務狀況"] = (r, 20)
 
-    # 4. 獲利穩定（15）：每年都賺錢
+    # 4. 獲利穩定（15）：10 年年年賺錢
     r = []
     if len(eps) >= 3:
         pos = int((eps > 0).sum())
-        r.append((f"{len(eps)} 年中 {pos} 年 EPS 為正（標準：年年獲利）", 15 if pos == len(eps) else 0))
+        short = "（資料只有這幾年）" if len(eps) < 10 else ""
+        r.append((f"{eps.index[0]}–{eps.index[-1]} 共 {len(eps)} 年中 {pos} 年 EPS 為正{short}（標準：10 年都獲利）",
+                  15 if pos == len(eps) else 0))
     s["獲利穩定"] = (r, 15)
 
-    # 5. 股利紀錄（10）：年年配息
+    # 5. 股利紀錄（10）：20 年不中斷配息
     r = []
     if len(y):
-        yrs = list(range(int(y.index.min()), int(y.index.max()) + 1))
+        end = int(y.index.max())
+        start = max(end - 19, DIV_DATA_START)
+        yrs = list(range(start, end + 1))
         paid = sum(1 for yr in yrs if divy.get(yr, 0) > 0)
-        r.append((f"{yrs[0]}–{yrs[-1]} 年中 {paid} 年有發股利（標準：不中斷）",
-                  10 if paid == len(yrs) else 5 if paid >= 0.7 * len(yrs) else 0))
+        note = f"（可靠的股利資料從 {DIV_DATA_START} 年起，只能看 {len(yrs)} 年）" if len(yrs) < 20 else ""
+        r.append((f"{start}–{end} 年中 {paid} 年有發股利{note}（標準：20 年不中斷）",
+                  10 if paid == len(yrs) else 5 if paid >= 0.8 * len(yrs) else 0))
     s["股利紀錄"] = (r, 10)
 
-    # 6. 盈餘成長（10）：最後 3 年平均 EPS 比最早 3 年平均多 1/3 以上
+    # 6. 盈餘成長（10）：10 年間，最後 3 年平均 EPS 比最早 3 年平均多 1/3 以上
     r = []
     if len(eps) >= 6:
         a, z = eps.head(3).mean(), eps.tail(3).mean()
         g = _growth(z, a)
+        span = f"{eps.index[0]}–{eps.index[2]} → {eps.index[-3]}–{eps.index[-1]}"
         if np.isfinite(g):
-            r.append((f"近 3 年平均 EPS 比早期 3 年 {g:+.0f}%（標準 ≥ +33%）", 10 if g >= 33 else 5 if g > 0 else 0))
+            gt = f"{g:+.0f}%" if g < 1000 else "超過 +1000%（早期幾乎沒賺錢）"
+            r.append((f"3 年平均 EPS {span}：{gt}（標準 ≥ +33%）", 10 if g >= 33 else 5 if g > 0 else 0))
         else:
             r.append(("早期 3 年平均 EPS 為負，無法比較", 0))
     s["盈餘成長"] = (r, 10)
@@ -276,30 +290,36 @@ def lynch_category(eps, g):
     return "緩慢成長股" if g < 5 else "穩定成長股" if g < 15 else "快速成長股"
 
 
+LYNCH_MAX_G = 25.0     # 林區：年成長超過 20～25% 很難長期維持
+
+
 def lynch(y, q, b, price, dy, rev, fin):
     s = {}
     eps = y["eps"].dropna()
-    tail = eps.tail(6)
-    g = _cagr(tail.iloc[0], tail.iloc[-1], len(tail) - 1) * 100 if len(tail) >= 3 else np.nan
+    g = eps_growth(eps.tail(6)) * 100       # 對數迴歸，不受頭尾兩年影響；有虧損年度 → nan
     cat = lynch_category(eps, g)
     ttm = _ttm_eps(q)
     pe = price / ttm if np.isfinite(ttm) and ttm > 0 else np.nan
     dy = dy if np.isfinite(dy) else 0.0
 
-    # 1. PEG（40）：本益比 ÷（盈餘成長率＋殖利率）
+    # 1. PEG（40）：林區的「（長期成長率＋殖利率）÷ 本益比」：< 1 差、1.5 可以、≥ 2 才是要找的
     r, pegy = [], np.nan
     if not np.isfinite(ttm):
         pass
     elif ttm <= 0:
         r.append(("近 4 季 EPS 為負，PEG 不適用", 0))
-    elif not np.isfinite(g) or g + dy <= 0:
+    elif not np.isfinite(g):
+        r.append((f"本益比 {pe:.1f} 倍；近幾年有虧損年度，算不出穩定的成長率，PEG 不適用", 0))
+    elif g + dy <= 0:
         r.append((f"本益比 {pe:.1f} 倍，但盈餘沒有成長，PEG 不適用", 0))
     else:
-        g_used = min(g, 30.0)
-        pegy = pe / (g_used + dy)
-        pts = 40 if pegy <= 0.5 else 30 if pegy <= 1 else 15 if pegy <= 1.5 else 0
-        note = "（成長率以 30% 計）" if g > 30 else ""
-        r.append((f"本益比 {pe:.1f} ÷（EPS 年成長 {g:.1f}%{note}＋殖利率 {dy:.1f}%）= {pegy:.2f}（≤ 1 合理、≤ 0.5 便宜）", pts))
+        g_used = min(g, LYNCH_MAX_G)
+        ratio = (g_used + dy) / pe
+        pegy = 1 / ratio
+        pts = 40 if ratio >= 2 else 30 if ratio >= 1.5 else 15 if ratio >= 1 else 0
+        note = f"（以 {LYNCH_MAX_G:.0f}% 計，太高的成長難以持續）" if g > LYNCH_MAX_G else ""
+        r.append((f"（EPS 年成長 {g:.1f}%{note}＋殖利率 {dy:.1f}%）÷ 本益比 {pe:.1f} = {ratio:.2f}"
+                  f"（< 1 差、1.5 可以、≥ 2 好）", pts))
         if cat == "景氣循環股":
             r.append(("景氣循環股：本益比低的時候常是景氣高點，林區提醒別被騙，PEG 分數減半", -(pts // 2)))
     s["PEG"] = (r, 40)
@@ -466,6 +486,7 @@ def build_all(code, price, hist, ins, data=None, divy=None, mkt=(None, None)):
     if len(y_all) < 3:
         return None, None
     y = y_all.tail(6)
+    y10 = y_all.tail(10)
     q, b = quarters(inc), balance(bs)
     fin = is_financial(y)
     if divy is None:
@@ -479,8 +500,8 @@ def build_all(code, price, hist, ins, data=None, divy=None, mkt=(None, None)):
     foreign = (ins or {}).get("foreign")
 
     res = {
-        "buffett": buffett.evaluate(y, price),
-        "graham": graham(y, q, b, divy, price, fin),
+        "buffett": buffett.evaluate(y, price, y10),
+        "graham": graham(y10, q, b, divy, price, fin),
         "lynch": lynch(y, q, b, price, dy, rev, fin),
         "oneil": oneil(y, q, hist, price, foreign, mkt[0], mkt[1], fin),
     }
