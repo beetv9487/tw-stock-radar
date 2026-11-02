@@ -47,7 +47,8 @@ def _token():
     return t or os.environ.get("FINMIND_TOKEN", "")
 
 
-def _fetch(dataset, code, start):
+def fetch_rows(dataset, code, start):
+    """FinMind 原始資料（所有欄位）"""
     params = {"dataset": dataset, "data_id": code, "start_date": start}
     headers = {}
     tok = _token()
@@ -58,7 +59,12 @@ def _fetch(dataset, code, start):
     j = r.json()
     if j.get("status") != 200:
         raise RuntimeError(j.get("msg") or "FinMind 回傳錯誤")
-    return pd.DataFrame(j.get("data") or [], columns=["date", "type", "value"])
+    return pd.DataFrame(j.get("data") or [])
+
+
+def _fetch(dataset, code, start):
+    df = fetch_rows(dataset, code, start)
+    return df.reindex(columns=["date", "type", "value"])
 
 
 # 抓不到時丟出錯誤，這樣失敗結果不會被快取住
@@ -164,7 +170,8 @@ def intrinsic_value(y):
         return np.nan, {"base": base}
     eps = y["eps"].dropna()
     g = _cagr(eps.iloc[0], eps.iloc[-1], len(eps) - 1) if len(eps) >= 3 else np.nan
-    g_used = float(min(max(g if np.isfinite(g) else 0.0, 0.0), MAX_G))
+    cyclical = eps_cv(eps) > 0.6
+    g_used = 0.0 if cyclical else float(min(max(g if np.isfinite(g) else 0.0, 0.0), MAX_G))
 
     pv, cash = 0.0, base
     for t in range(1, YEARS + 1):
@@ -172,7 +179,16 @@ def intrinsic_value(y):
         pv += cash / (1 + DISCOUNT) ** t
     terminal = cash * (1 + TERMINAL_G) / (DISCOUNT - TERMINAL_G)
     pv += terminal / (1 + DISCOUNT) ** YEARS
-    return float(pv), {"base": float(base), "g": g, "g_used": g_used}
+    return float(pv), {"base": float(base), "g": g, "g_used": g_used, "cyclical": cyclical}
+
+
+def eps_cv(eps):
+    """EPS 波動：標準差 ÷ 平均（平均 ≤ 0 視為波動極大）"""
+    e = eps.dropna()
+    if len(e) < 3:
+        return np.nan
+    m = e.mean()
+    return float(e.std(ddof=0) / m) if m > 0 else np.inf
 
 
 # ------------------------------------------------------------
@@ -193,8 +209,9 @@ def evaluate(y, price):
     if len(roe):
         avg = roe.mean()
         good = int((roe >= 15).sum())
-        pts = 25 if avg >= 20 else 20 if avg >= 15 else 10 if avg >= 10 else 0
-        r.append(_pass(pts, f"近 {len(roe)} 年平均 ROE {avg:.1f}%（{good} 年 ≥ 15%）"))
+        frac = good / len(roe)
+        pts = 25 if frac == 1 else 18 if frac >= 0.8 else 10 if frac >= 0.6 else 0
+        r.append(_pass(pts, f"近 {len(roe)} 年有 {good} 年 ROE ≥ 15%（平均 {avg:.1f}%；標準：每年都要高）"))
     sections["ROE"] = (r, 25)
 
     # 2. 獲利穩定（15 分）
@@ -202,10 +219,16 @@ def evaluate(y, price):
     r = []
     if len(eps) >= 2:
         pos = int((eps > 0).sum())
-        r.append(_pass(10 if pos == len(eps) else 0, f"{len(eps)} 年中 {pos} 年 EPS 為正"))
+        r.append(_pass(5 if pos == len(eps) else 0, f"{len(eps)} 年中 {pos} 年 EPS 為正"))
         ups = int((eps.diff().dropna() > 0).sum())
         need = int(np.ceil((len(eps) - 1) * 0.6))
         r.append(_pass(5 if ups >= need else 0, f"EPS 比前一年成長的年數：{ups}／{len(eps) - 1}"))
+        cv = eps_cv(eps)
+        if np.isfinite(cv):
+            r.append(_pass(5 if cv <= 0.5 else 0,
+                           f"EPS 波動（標準差÷平均）{cv:.2f}" + ("，獲利可預測" if cv <= 0.5 else "，大起大落不好預測")))
+        elif len(eps) >= 3:
+            r.append(_pass(0, "EPS 平均為負，獲利無法預測"))
     sections["獲利穩定"] = (r, 15)
 
     if is_fin:
@@ -322,30 +345,43 @@ def render(code, price):
     </div>""", unsafe_allow_html=True)
 
     with st.expander("🎩 巴菲特檢查：每一分怎麼來的"):
-        html_parts = []
-        for k, (rules, w) in secs.items():
-            html_parts.append(f"<b style='color:#55cfff'>{_e(k)}（滿分 {w}）</b>" + _rules_html(rules) + "<br>")
-        st.markdown("".join(html_parts), unsafe_allow_html=True)
+        detail(b)
 
-        y = b["y"]
-        tbl = pd.DataFrame({
-            "年度": y.index,
-            "ROE%": y["roe"].round(1),
-            "EPS": y["eps"].round(2),
-            "毛利率%": y["gm"].round(1),
-            "負債/權益": y["de"].round(2),
-            "自由現金流(億)": (y["fcf"] / 1e8).round(0),
-        })
-        st.dataframe(tbl, hide_index=True, width="stretch")
 
-        info = b["iv_info"]
-        if np.isfinite(b["iv"]):
-            g = info.get("g")
+def rules_block(secs):
+    """各項規則與得分（四位大師共用）"""
+    html_parts = []
+    for k, (rules, w) in secs.items():
+        html_parts.append(f"<b style='color:#55cfff'>{_e(k)}（滿分 {w}）</b>" + _rules_html(rules) + "<br>")
+    st.markdown("".join(html_parts), unsafe_allow_html=True)
+
+
+def detail(b):
+    rules_block(b["sections"])
+
+    y = b["y"]
+    tbl = pd.DataFrame({
+        "年度": y.index,
+        "ROE%": y["roe"].round(1),
+        "EPS": y["eps"].round(2),
+        "毛利率%": y["gm"].round(1),
+        "負債/權益": y["de"].round(2),
+        "自由現金流(億)": (y["fcf"] / 1e8).round(0),
+    })
+    st.dataframe(tbl, hide_index=True, width="stretch")
+
+    info = b["iv_info"]
+    if np.isfinite(b["iv"]):
+        g = info.get("g")
+        if info.get("cyclical"):
+            st.caption(f"內在價值估法：近 3 年平均每股自由現金流 {info['base']:.2f} 元；"
+                       "獲利大起大落，不假設未來會成長。景氣循環股的現金流會隨景氣大幅變動，這個估計特別不可靠。")
+        else:
             st.caption(
                 f"內在價值估法：近 3 年平均每股自由現金流 {info['base']:.2f} 元，"
                 f"前 {YEARS} 年每年成長 {info['g_used'] * 100:.1f}%"
                 f"（EPS 歷史年成長 {g * 100:.1f}%，上限 {MAX_G * 100:.0f}%）" if np.isfinite(g) else
                 f"內在價值估法：近 3 年平均每股自由現金流 {info['base']:.2f} 元，假設不成長"
             )
-            st.caption(f"折現率 {DISCOUNT * 100:.0f}%、永續成長 {TERMINAL_G * 100:.1f}%。"
-                       "正在大量擴廠的公司，自由現金流會被資本支出壓低，內在價值容易低估。")
+        st.caption(f"折現率 {DISCOUNT * 100:.0f}%、永續成長 {TERMINAL_G * 100:.1f}%。"
+                   "正在大量擴廠的公司，自由現金流會被資本支出壓低，內在價值容易低估。")
