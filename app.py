@@ -16,7 +16,7 @@ import altair as alt
 
 import screener
 import insights
-import buffett
+import masters
 
 APP_NAME = "我的台股雷達"
 TZ = timezone(timedelta(hours=8))            # 台灣時區 UTC+8
@@ -550,9 +550,9 @@ st.markdown(f"""
 insights.render(ins, name)
 
 
-# ---------- 🎩 巴菲特檢查（近年財報，跟上面的雷達分數分開算） ----------
+# ---------- 🧠 四位大師怎麼看（近年財報，跟上面的雷達分數分開算） ----------
 
-buffett.render(code, price)
+masters.render(code, price, hist, ins)
 
 
 # ---------- 走勢圖 ----------
