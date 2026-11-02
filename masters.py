@@ -67,6 +67,31 @@ def market():
         return None, None
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_hist(tickers):
+    """選股用：('2330.TW', ...) → {ticker: 近 2 年日 K（含成交量）}"""
+    out = {}
+    tickers = list(tickers)
+    for i in range(0, len(tickers), 50):
+        batch = tickers[i:i + 50]
+        try:
+            df = yf.download(batch, period="2y", interval="1d", group_by="ticker",
+                             auto_adjust=False, threads=True, progress=False)
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        for t in batch:
+            try:
+                sub = df[t] if isinstance(df.columns, pd.MultiIndex) else df
+                sub = sub.dropna(subset=["Close"])
+                if len(sub) >= 60:
+                    out[t] = sub[["Open", "High", "Low", "Close", "Volume"]].copy()
+            except KeyError:
+                pass
+    return out
+
+
 def quarters(inc):
     q = _wide(inc)
     if q.empty:
@@ -394,7 +419,7 @@ def oneil(y, q, hist, price, foreign, mkt, mkt_name, fin=False):
         sr, mr = _ret(hist["Close"]), _ret(mkt["Close"])
         if np.isfinite(sr) and np.isfinite(mr):
             diff = sr - mr
-            r.append((f"近一年漲幅 {sr:+.0f}% vs {mkt_name} {mr:+.0f}%（贏 {diff:+.0f} 個百分點）",
+            r.append((f"近一年漲幅 {sr:+.0f}% vs {mkt_name} {mr:+.0f}%（{'贏' if diff >= 0 else '輸'} {abs(diff):.0f} 個百分點）",
                       15 if diff >= 20 else 8 if diff > 0 else 0))
     s["L 領導股"] = (r, 15)
 
@@ -466,6 +491,9 @@ def build_all(code, price, hist, ins, data=None, divy=None, mkt=(None, None)):
 # ------------------------------------------------------------
 # 畫面
 # ------------------------------------------------------------
+
+# 選股頁顯示的短名稱
+SHORT = {"buffett": "巴菲特", "graham": "葛拉漢", "lynch": "林區", "oneil": "歐尼爾"}
 
 MASTERS = [
     ("buffett", "🎩 巴菲特", "好公司＋合理價"),
