@@ -701,9 +701,9 @@ MV_CAP = 70     # 不是 8 條全中就不算第二階段 → 總分最多 70
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _closes(day_str):
-    """某一天上市＋上櫃全部股票收盤價 {代號: 收盤}；非交易日回 {}"""
+    """某一天上市＋上櫃全部股票收盤價 ({代號: 收盤}, 上櫃有沒有抓到)；抓不到丟錯誤"""
     import screener
-    out = {}
+    out, otc = {}, False
     try:
         p = screener._get_json("https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
                                {"date": day_str, "type": "ALLBUT0999", "response": "json"})
@@ -723,12 +723,13 @@ def _closes(day_str):
             i = t["fields"].index("收盤")
             for r in t["data"]:
                 out[screener._clean(r[0])] = screener._num(r[i])
+            otc = True
     except Exception:
         pass
     out = {k: v for k, v in out.items() if screener.STOCK_CODE.match(k) and np.isfinite(v) and v > 0}
     if not out:      # 還沒收盤或抓不到：丟錯誤，才不會把空結果快取 6 小時
         raise LookupError(f"{day_str} 沒有收盤資料")
-    return out
+    return out, otc
 
 
 def rs_score(c0, c63, c126, c189, c252):
@@ -739,7 +740,9 @@ def rs_score(c0, c63, c126, c189, c252):
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _rs_table(days):
     """days：(今天, 63, 126, 189, 252 個交易日前) 的日期字串 → {代號: RS 排名 1～99}、日期"""
-    px = [_closes(d) for d in days]
+    got = [_closes(d) for d in days]
+    px = [g[0] for g in got]
+    otc = all(g[1] for g in got)
     if any(len(p) < 500 for p in px):
         raise LookupError("全市場收盤價抓不齊")
     raw = {}
@@ -749,7 +752,7 @@ def _rs_table(days):
             raw[code] = rs_score(c0, *cs)
     s = pd.Series(raw)
     rank = (s.rank(pct=True) * 99).clip(1, 99).round().astype(int)
-    return rank.to_dict(), len(s)
+    return rank.to_dict(), len(s), otc
 
 
 def rs_table(mkt):
@@ -760,8 +763,8 @@ def rs_table(mkt):
     for back in (0, 1):      # 盤中大盤已有今天的 K 線，但證交所收盤資料要收盤後才有 → 改用前一個交易日
         days = tuple(idx[-1 - back - n].strftime("%Y%m%d") for n in (0, 63, 126, 189, 252))
         try:
-            rank, n = _rs_table(days)
-            return {"rank": rank, "n": n, "date": idx[-1 - back]}
+            rank, n, otc = _rs_table(days)
+            return {"rank": rank, "n": n, "otc": otc, "date": idx[-1 - back]}
         except Exception:
             continue
     return None
@@ -803,7 +806,8 @@ def minervini(code, hist, price, rs):
     rk = (rs or {}).get("rank", {}).get(str(code))
     if rk is not None:
         rule("⑧ 相對強度 RS ≥ 70", rk >= 70,
-             f"RS 排名 {rk}（在全市場 {rs['n']} 檔中，近一年漲幅勝過 {rk}% 的股票；最好 80、90 以上）", 13)
+             f"RS 排名 {rk}（在{'上市櫃' if rs.get('otc') else '上市'} {rs['n']} 檔股票中，"
+             f"近一年加權漲幅勝過 {rk}% 的股票；最好 80、90 以上）", 13)
     else:
         s["⑧ 相對強度 RS ≥ 70"] = ([], 13)
 
