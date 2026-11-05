@@ -1,13 +1,16 @@
 # ============================================================
-# 🧠 四位大師會診
+# 🧠 七位大師會診（依投資光譜分四區）
 #
-# 把四位投資人公開寫過的選股原則寫成規則，各自打 0～100 分：
-#   🎩 巴菲特：好公司＋合理價（buffett.py）
-#   📘 葛拉漢：便宜＋財務安全（《智慧型股票投資人》防禦型投資人的條件）
-#   🔍 彼得・林區：成長＋價格合理（PEG、公司分類、存貨警訊）
-#   🚀 歐尼爾：成長＋動能（CAN SLIM 七個字母）
+# 把七位投資人公開寫過的選股原則寫成規則，各自打 0～100 分：
+#   深度價值  📘 葛拉漢：便宜＋財務安全（《智慧型股票投資人》防禦型投資人的條件）
+#             📊 皮奧特洛斯基：F-score 九個訊號（2000 年論文），便宜股裡挑體質轉好的
+#   品質價值  🎩 巴菲特：好公司＋合理價（buffett.py）
+#             🧮 葛林布萊特：神奇公式，高資本報酬率＋高盈餘殖利率
+#   合理價成長 🔍 彼得・林區：成長＋價格合理（PEG、公司分類、存貨警訊）
+#   成長動能  🚀 歐尼爾：成長＋動能（CAN SLIM 七個字母）
+#             📈 米奈爾維尼：趨勢樣板八條件（《超級績效》）
 #
-# 同一檔股票，四個人常常意見不同——這正是要看的地方。
+# 同一檔股票，不同流派常常意見不同——這正是要看的地方；同一區內意見一致才算「共識」。
 # 都是把原則公式化的參考，不代表本人的看法，也不構成投資建議。
 # ============================================================
 
@@ -30,21 +33,54 @@ TZ = timezone(timedelta(hours=8))
 # ------------------------------------------------------------
 
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
+def _div_rows(code):
+    start = f"{datetime.now(TZ).year - 21}-01-01"      # 葛拉漢要 20 年配息紀錄
+    return buffett.fetch_rows("TaiwanStockDividend", code, start)
+
+
 def _dividends(code):
     """每年發的股利（現金＋股票，元／股），用除權息資料日期的年份分組"""
-    start = f"{datetime.now(TZ).year - 21}-01-01"      # 葛拉漢要 20 年配息紀錄
-    d = buffett.fetch_rows("TaiwanStockDividend", code, start)
-    return dividend_years(d)
+    return dividend_years(_div_rows(code))
+
+
+def _div_num(d, *cols):
+    out = pd.Series(0.0, index=d.index)
+    for c in cols:
+        if c in d:
+            out = out + pd.to_numeric(d[c], errors="coerce").fillna(0)
+    return out
 
 
 def dividend_years(d):
     if d is None or d.empty or "date" not in d:
         return pd.Series(dtype=float)
-    num = lambda c: (pd.to_numeric(d[c], errors="coerce").fillna(0) if c in d
-                     else pd.Series(0.0, index=d.index))
-    total = num("CashEarningsDistribution") + num("CashStatutorySurplus") \
-        + num("StockEarningsDistribution") + num("StockStatutorySurplus")
+    total = _div_num(d, "CashEarningsDistribution", "CashStatutorySurplus",
+                     "StockEarningsDistribution", "StockStatutorySurplus")
     return total.groupby(pd.to_datetime(d["date"]).dt.year).sum()
+
+
+def stock_dividend_years(d):
+    """每年配的股票股利（元／股；面額 10 元，1 元＝配 10% 的股票）"""
+    if d is None or d.empty or "date" not in d:
+        return pd.Series(dtype=float)
+    s = _div_num(d, "StockEarningsDistribution", "StockStatutorySurplus")
+    return s.groupby(pd.to_datetime(d["date"]).dt.year).sum()
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _industries():
+    """{代號: 產業別}（FinMind TaiwanStockInfo，一次抓全部）"""
+    d = buffett.fetch_rows("TaiwanStockInfo", "", "2000-01-01")
+    if d.empty or "stock_id" not in d:
+        return {}
+    return dict(zip(d["stock_id"].astype(str), d["industry_category"].astype(str)))
+
+
+def industry(code):
+    try:
+        return _industries().get(str(code), "")
+    except Exception:
+        return ""
 
 
 # 大盤：加權指數，抓不到改用 0050
@@ -101,6 +137,8 @@ def quarters(inc):
         "revenue": _col(q, "Revenue"),
         "ni": _col(q, *NI_NAMES),
         "eps": _col(q, "EPS"),
+        "op": _col(q, "OperatingIncome"),
+        "gross": _col(q, "GrossProfit"),
     }).sort_index()
 
 
@@ -114,11 +152,25 @@ def balance(bs):
         "ca": _col(b, "CurrentAssets"),
         "cl": _col(b, "CurrentLiabilities"),
         "inv": _col(b, "Inventories"),
+        "ta": _col(b, "TotalAssets"),
+        "cash": _col(b, "CashAndCashEquivalents"),
+        "std": _col(b, "ShorttermBorrowings"),
+        "ppe": _col(b, "PropertyPlantAndEquipment"),
+        "cap": _col(b, "OrdinaryShare", "CapitalStock"),     # 普通股股本
     })
     # 長期負債＝應付公司債＋長期借款；兩欄都沒有才算缺資料
     lt = pd.concat([_col(b, "BondsPayable"), _col(b, "LongtermBorrowings")], axis=1)
     out["ltd"] = lt.sum(axis=1, min_count=1)
     return out.sort_index()
+
+
+def year_end(b):
+    """季資產負債表 → 每年 12/31 那一筆，index 是年份"""
+    if b.empty:
+        return b
+    e = b[(b.index.month == 12) & (b.index.day == 31)].copy()
+    e.index = e.index.year
+    return e
 
 
 def _shares(q):
@@ -158,10 +210,10 @@ def is_financial(y):
     return bool(y["gross"].isna().all() and (y["de"].dropna() > 5).any())
 
 
-def _finish(sections, cap=None, cap_note="", **extra):
+def _finish(sections, cap=None, cap_note="", min_cover=MIN_COVER, **extra):
     have = {k: v for k, v in sections.items() if v[0]}
     full = sum(w for _, (_, w) in have.items())
-    if full < MIN_COVER:      # 能評的項目太少，分數會失真 → 不給分
+    if full < min_cover:      # 能評的項目太少，分數會失真 → 不給分
         return None
     got = sum(p for _, (rules, _) in have.items() for _, p in rules)
     score = int(round(got / full * 100))
@@ -473,11 +525,304 @@ def oneil(y, q, hist, price, foreign, mkt, mkt_name, fin=False):
 
 
 # ------------------------------------------------------------
+# 🧮 葛林布萊特：神奇公式（《打敗大盤的獲利公式》The Little Book That Beats the Market）
+#   資本報酬率 ROC ＝ EBIT ÷（淨營運資金＋淨固定資產）：好公司
+#   盈餘殖利率 EY ＝ EBIT ÷ 企業價值（市值＋有息負債 − 多餘現金）：便宜
+#   本人的做法是全市場兩項各自排名、名次相加，越小越好；不適用金融股、公用事業。
+#   這裡沒有全市場排名，改用分段換成分數；6% 是他書中說的最低報酬門檻
+#   （投資至少要贏 10 年期公債，公債低於 6% 時以 6% 計）。
+# ------------------------------------------------------------
+
+GB_HURDLE = 6.0
+
+
+def _ttm(s):
+    s = s.dropna()
+    return float(s.tail(4).sum()) if len(s) >= 4 else np.nan
+
+
+def greenblatt(q, b, price, fin, ind):
+    if fin or ind in ("金融保險業", "油電燃氣業"):
+        return {"score": None, "na": "金融股、公用事業不適用（葛林布萊特本人就把這兩類排除在外）"}
+    s = {}
+    ebit = _ttm(q["op"])          # 營業利益（近 4 季）當作 EBIT
+    shares = _shares(q)
+    last = b.iloc[-1] if not b.empty else None
+    z = lambda v: float(v) if v is not None and np.isfinite(v) else 0.0
+    ey = roc = np.nan
+
+    # 1. 盈餘殖利率（50）
+    r = []
+    if np.isfinite(ebit) and np.isfinite(shares) and last is not None and np.isfinite(price):
+        mcap = price * shares
+        debt = z(last["std"]) + z(last["ltd"])
+        cash = z(last["cash"])
+        ev = mcap + debt - cash
+        base = (f"近 4 季營業利益 {ebit / 1e8:,.0f} 億 ÷ 企業價值 {ev / 1e8:,.0f} 億"
+                f"（市值 {mcap / 1e8:,.0f} ＋ 有息負債 {debt / 1e8:,.0f} − 現金 {cash / 1e8:,.0f}）")
+        if ebit <= 0:
+            r.append((f"近 4 季營業利益 {ebit / 1e8:,.0f} 億（虧損），不符合", 0))
+        elif ev <= 0:
+            r.append((base + "：現金比市值＋負債還多，盈餘殖利率極高", 50))
+        else:
+            ey = ebit / ev * 100
+            pts = 50 if ey >= 15 else 35 if ey >= 10 else 20 if ey >= GB_HURDLE else 0
+            r.append((base + f" = {ey:.1f}%（≥ 15% 很便宜；低於 {GB_HURDLE:.0f}% 不如買公債）", pts))
+    s["盈餘殖利率（便宜）"] = (r, 50)
+
+    # 2. 資本報酬率（50）
+    r = []
+    if np.isfinite(ebit) and last is not None and np.isfinite(last["ca"]) and np.isfinite(last["cl"]) \
+            and np.isfinite(last["ppe"]):
+        nwc = (last["ca"] - z(last["cash"])) - (last["cl"] - z(last["std"]))
+        cap = nwc + last["ppe"]
+        base = (f"近 4 季營業利益 {ebit / 1e8:,.0f} 億 ÷（淨營運資金 {nwc / 1e8:,.0f} 億 ＋ "
+                f"不動產廠房設備 {last['ppe'] / 1e8:,.0f} 億）")
+        if ebit <= 0:
+            r.append((base + "：虧損，不符合", 0))
+        elif cap <= 0:
+            r.append((base + "：幾乎不用投入資本就能賺錢，資本報酬率極高", 50))
+        else:
+            roc = ebit / cap * 100
+            pts = 50 if roc >= 50 else 35 if roc >= 25 else 20 if roc >= 15 else 0
+            r.append((base + f" = {roc:.0f}%（≥ 50% 很好、≥ 25% 好）", pts))
+    s["資本報酬率（好公司）"] = (r, 50)
+
+    cheap_fail = bool(s["盈餘殖利率（便宜）"][0]) and np.isfinite(ey) and ey < GB_HURDLE
+    return _finish(s, cap=40 if cheap_fail else None,
+                   cap_note=f"盈餘殖利率低於 {GB_HURDLE:.0f}%：葛林布萊特說報酬贏不了公債就不值得買，所以總分最多 40。",
+                   ey=ey, roc=roc)
+
+
+# ------------------------------------------------------------
+# 📊 皮奧特洛斯基：F-score（Piotroski 2000, Journal of Accounting Research）
+#   九個 0/1 訊號，用最近一個完整年度和前一年比：
+#   獲利 ROA>0、CFO>0、ΔROA>0、CFO>淨利；財務 長期負債比下降、流動比率上升、沒有發新股；
+#   效率 毛利率上升、資產週轉率上升。ROA、CFO、週轉率都用「年初」總資產當分母。
+#   原論文是在「股價淨值比低」的價值股裡用 F-score 挑出體質變好的。
+# ------------------------------------------------------------
+
+def piotroski(y, b, sdiv, fin):
+    e = year_end(b)
+    s = {"獲利能力": ([], 4), "財務結構": ([], 3), "營運效率": ([], 2)}
+    yrs = [t for t in y.index if t in e.index and t - 1 in e.index]
+    if not yrs:
+        return None
+    t = max(yrs)
+    if t - 1 not in y.index:
+        return None
+    ta0, ta1 = e.loc[t - 1, "ta"], e.loc[t, "ta"]          # 年初、年底總資產
+    ni, ni_p = y.loc[t, "ni"], y.loc[t - 1, "ni"]
+    ocf = y.loc[t, "ocf"]
+    na = []
+
+    def sig(sec, ok, txt):
+        if ok is None:
+            return
+        s[sec][0].append((("✔ " if ok else "✘ ") + txt, 1 if ok else 0))
+
+    # ---- 獲利能力 ----
+    roa = ni / ta0 * 100 if np.isfinite(ni) and np.isfinite(ta0) and ta0 > 0 else np.nan
+    if np.isfinite(roa):
+        sig("獲利能力", roa > 0, f"ROA（淨利 ÷ 年初總資產）{roa:.1f}% > 0")
+    cfo = ocf / ta0 * 100 if np.isfinite(ocf) and np.isfinite(ta0) and ta0 > 0 else np.nan
+    if np.isfinite(cfo):
+        sig("獲利能力", cfo > 0, f"營業現金流 ÷ 年初總資產 {cfo:.1f}% > 0")
+    if t - 2 in e.index and np.isfinite(roa):
+        ta00 = e.loc[t - 2, "ta"]
+        roa_p = ni_p / ta00 * 100 if np.isfinite(ni_p) and np.isfinite(ta00) and ta00 > 0 else np.nan
+        if np.isfinite(roa_p):
+            sig("獲利能力", roa > roa_p, f"ROA 比前一年進步：{roa_p:.1f}% → {roa:.1f}%")
+    if np.isfinite(cfo) and np.isfinite(roa):
+        sig("獲利能力", cfo > roa, f"營業現金流 {cfo:.1f}% > 淨利 {roa:.1f}%（獲利是真現金，應計項目少）")
+
+    # ---- 財務結構（金融股不適用：存款、保單本來就是負債，也沒有流動資產這一項）----
+    if fin:
+        na = ["財務結構", "營運效率"]
+    else:
+        if t - 2 in e.index:
+            ltd = lambda yr: e.loc[yr, "ltd"] if np.isfinite(e.loc[yr, "ltd"]) else 0.0
+            avg = lambda yr: (e.loc[yr, "ta"] + e.loc[yr - 1, "ta"]) / 2
+            if np.isfinite(avg(t)) and np.isfinite(avg(t - 1)):
+                l1, l0 = ltd(t) / avg(t) * 100, ltd(t - 1) / avg(t - 1) * 100
+                if l1 == 0 and l0 == 0:
+                    sig("財務結構", True, "兩年都沒有長期負債（沒有增加槓桿）")
+                else:
+                    sig("財務結構", l1 < l0, f"長期負債 ÷ 平均總資產 下降：{l0:.1f}% → {l1:.1f}%")
+        cr = lambda yr: e.loc[yr, "ca"] / e.loc[yr, "cl"] if e.loc[yr, "cl"] > 0 else np.nan
+        c1, c0 = cr(t), cr(t - 1)
+        if np.isfinite(c1) and np.isfinite(c0):
+            sig("財務結構", c1 > c0, f"流動比率上升：{c0:.2f} → {c1:.2f}")
+    k1, k0 = e.loc[t, "cap"], e.loc[t - 1, "cap"]
+    if np.isfinite(k1) and np.isfinite(k0) and k0 > 0:
+        g = (k1 / k0 - 1) * 100
+        sd = float(sdiv.get(t, 0)) * 10        # 股票股利 1 元 ＝ 股本增加 10%
+        issued = g > sd + 0.5
+        txt = f"股本 {g:+.1f}%" + (f"（其中股票股利約 {sd:.1f}%，不算發新股）" if sd > 0 else "")
+        if fin:
+            s["財務結構"] = ([], 3)
+            s["發行新股"] = ([], 1)
+            sig("發行新股", not issued, ("沒有發行新股：" if not issued else "有發行新股（現增、轉換債或員工股）：") + txt)
+        else:
+            sig("財務結構", not issued, ("沒有發行新股：" if not issued else "有發行新股（現增、轉換債或員工股）：") + txt)
+
+    # ---- 營運效率 ----
+    if not fin:
+        gm = y["gross"] / y["revenue"] * 100
+        if np.isfinite(gm.get(t, np.nan)) and np.isfinite(gm.get(t - 1, np.nan)):
+            sig("營運效率", gm[t] > gm[t - 1], f"毛利率上升：{gm[t - 1]:.1f}% → {gm[t]:.1f}%")
+        if t - 2 in e.index:
+            tu = lambda yr: y.loc[yr, "revenue"] / e.loc[yr - 1, "ta"] if yr in y.index else np.nan
+            u1, u0 = tu(t), tu(t - 1)
+            if np.isfinite(u1) and np.isfinite(u0):
+                sig("營運效率", u1 > u0, f"資產週轉率（營收 ÷ 年初總資產）上升：{u0:.2f} → {u1:.2f}")
+
+    n = sum(len(v[0]) for v in s.values())
+    f = sum(p for v in s.values() for _, p in v[0])
+    if n < 5:
+        return None
+    # 每個訊號等重，換成 0～100：F ÷ 能評的訊號數
+    s = {k: (rules, len(rules) or w) for k, (rules, w) in s.items()}
+    res = _finish(s, min_cover=0, fscore=f, n_signals=n, year=t)
+    res["na_secs"] = na
+    return res
+
+
+# ------------------------------------------------------------
+# 📈 米奈爾維尼：趨勢樣板（《超級績效》Trade Like a Stock Market Wizard 第 5 章）
+#   八個條件都要符合，才算在「第二階段」上升趨勢，他才會考慮買：
+#   1 股價 > 150 日與 200 日線  2 150 日線 > 200 日線  3 200 日線上揚至少 1 個月（最好 4～5 個月）
+#   4 50 日線 > 150、200 日線  5 股價 > 50 日線  6 股價比 52 週低點高 30% 以上
+#   7 股價距 52 週高點 25% 以內  8 相對強度（RS）排名 ≥ 70（最好 80、90 以上）
+# ------------------------------------------------------------
+
+MV_CAP = 70     # 不是 8 條全中就不算第二階段 → 總分最多 70
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _closes(day_str):
+    """某一天上市＋上櫃全部股票收盤價 {代號: 收盤}；非交易日回 {}"""
+    import screener
+    out = {}
+    try:
+        p = screener._get_json("https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+                               {"date": day_str, "type": "ALLBUT0999", "response": "json"})
+        t = next((t for t in p.get("tables") or [] if (t.get("fields") or [""])[0] == "證券代號"), None)
+        if t:
+            i = t["fields"].index("收盤價")
+            for r in t["data"]:
+                out[screener._clean(r[0])] = screener._num(r[i])
+    except Exception:
+        pass
+    try:
+        d = datetime.strptime(day_str, "%Y%m%d")
+        p = screener._get_json("https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes",
+                               {"date": d.strftime("%Y/%m/%d"), "type": "EW", "response": "json"})
+        t = (p.get("tables") or [{}])[0]
+        if t.get("data"):
+            i = t["fields"].index("收盤")
+            for r in t["data"]:
+                out[screener._clean(r[0])] = screener._num(r[i])
+    except Exception:
+        pass
+    out = {k: v for k, v in out.items() if screener.STOCK_CODE.match(k) and np.isfinite(v) and v > 0}
+    if not out:      # 還沒收盤或抓不到：丟錯誤，才不會把空結果快取 6 小時
+        raise LookupError(f"{day_str} 沒有收盤資料")
+    return out
+
+
+def rs_score(c0, c63, c126, c189, c252):
+    """IBD 式相對強度：最近一季權重 40%，前三季各 20%"""
+    return 0.4 * c0 / c63 + 0.2 * c0 / c126 + 0.2 * c0 / c189 + 0.2 * c0 / c252
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _rs_table(days):
+    """days：(今天, 63, 126, 189, 252 個交易日前) 的日期字串 → {代號: RS 排名 1～99}、日期"""
+    px = [_closes(d) for d in days]
+    if any(len(p) < 500 for p in px):
+        raise LookupError("全市場收盤價抓不齊")
+    raw = {}
+    for code, c0 in px[0].items():
+        cs = [p.get(code) for p in px[1:]]
+        if all(c is not None for c in cs):
+            raw[code] = rs_score(c0, *cs)
+    s = pd.Series(raw)
+    rank = (s.rank(pct=True) * 99).clip(1, 99).round().astype(int)
+    return rank.to_dict(), len(s)
+
+
+def rs_table(mkt):
+    """用大盤的交易日推出 0／63／126／189／252 天前是哪一天"""
+    if mkt is None or len(mkt) < 253:
+        return None
+    idx = mkt.index
+    for back in (0, 1):      # 盤中大盤已有今天的 K 線，但證交所收盤資料要收盤後才有 → 改用前一個交易日
+        days = tuple(idx[-1 - back - n].strftime("%Y%m%d") for n in (0, 63, 126, 189, 252))
+        try:
+            rank, n = _rs_table(days)
+            return {"rank": rank, "n": n, "date": idx[-1 - back]}
+        except Exception:
+            continue
+    return None
+
+
+def minervini(code, hist, price, rs):
+    s = {}
+    if hist is None or len(hist) < 260 or not np.isfinite(price):
+        return None
+    c = hist["Close"].dropna().copy()
+    c.iloc[-1] = price
+    ma = {n: c.rolling(n).mean() for n in (50, 150, 200)}
+    m50, m150, m200 = (float(ma[n].iloc[-1]) for n in (50, 150, 200))
+    yr = hist.tail(250)
+    hi, lo = float(max(yr["High"].max(), price)), float(min(yr["Low"].min(), price))
+    p = fmt_price
+
+    def rule(name, ok, txt, w):
+        s[name] = ([(("✔ " if ok else "✘ ") + txt, w if ok else 0)], w)
+
+    rule("① 股價在長期均線上", price > m150 and price > m200,
+         f"股價 {p(price)} vs 150 日線 {p(m150)}、200 日線 {p(m200)}（兩條都要在上方）", 13)
+    rule("② 150 日線 > 200 日線", m150 > m200, f"150 日線 {p(m150)} vs 200 日線 {p(m200)}", 12)
+    m200_1m, m200_5m = float(ma[200].iloc[-22]), float(ma[200].iloc[-106])
+    up1, up5 = m200 > m200_1m, bool((ma[200].iloc[-106:].diff().dropna() >= 0).mean() >= 0.9)
+    rule("③ 200 日線上揚", up1,
+         f"200 日線 1 個月前 {p(m200_1m)} → 現在 {p(m200)}（至少上揚 1 個月）"
+         + ("；近 5 個月都在往上，更好" if up1 and up5 else ""), 13)
+    rule("④ 50 日線在最上面", m50 > m150 and m50 > m200,
+         f"50 日線 {p(m50)} vs 150 日線 {p(m150)}、200 日線 {p(m200)}", 12)
+    rule("⑤ 股價 > 50 日線", price > m50, f"股價 {p(price)} vs 50 日線 {p(m50)}", 12)
+    above_lo = (price / lo - 1) * 100
+    rule("⑥ 離 52 週低點夠遠", above_lo >= 30,
+         f"比 52 週低點 {p(lo)} 高 {above_lo:.0f}%（標準 ≥ 30%，最強的常是 100% 以上）", 13)
+    below_hi = (1 - price / hi) * 100
+    rule("⑦ 接近 52 週高點", below_hi <= 25,
+         f"距 52 週高點 {p(hi)} 還差 {below_hi:.0f}%（標準：25% 以內，越近越好）", 12)
+
+    rk = (rs or {}).get("rank", {}).get(str(code))
+    if rk is not None:
+        rule("⑧ 相對強度 RS ≥ 70", rk >= 70,
+             f"RS 排名 {rk}（在全市場 {rs['n']} 檔中，近一年漲幅勝過 {rk}% 的股票；最好 80、90 以上）", 13)
+    else:
+        s["⑧ 相對強度 RS ≥ 70"] = ([], 13)
+
+    passed = sum(1 for rules, w in s.values() if rules and rules[0][1] > 0)
+    known = sum(1 for rules, _ in s.values() if rules)
+    all_ok = passed == known == 8
+    why = (f"8 個條件只符合 {passed} 個" if passed < known
+           else f"相對強度（RS）抓不到，無法確認 8 條全中")
+    return _finish(s, cap=None if all_ok else MV_CAP,
+                   cap_note=f"{why}：米奈爾維尼要全中才算第二階段上升趨勢，所以總分最多 {MV_CAP}。",
+                   passed=passed, known=known, stage2=all_ok)
+
+
+# ------------------------------------------------------------
 # 全部算一次
 # ------------------------------------------------------------
 
-def build_all(code, price, hist, ins, data=None, divy=None, mkt=(None, None)):
-    """回傳 {key: 結果 or None}, 財報最新季別"""
+def build_all(code, price, hist, ins, data=None, divy=None, mkt=(None, None), rs=None, need=None):
+    """回傳 {key: 結果 or None}, 財報最新季別。need：只算這幾位（選股時省 API 額度），None＝全部"""
     try:
         inc, bs, cf = data if data is not None else buffett._load(code)
     except Exception:
@@ -489,22 +834,45 @@ def build_all(code, price, hist, ins, data=None, divy=None, mkt=(None, None)):
     y10 = y_all.tail(10)
     q, b = quarters(inc), balance(bs)
     fin = is_financial(y)
-    if divy is None:
+    want = lambda k: need is None or k in need
+    div_rows = None
+    if divy is None and (want("graham") or want("piotroski")):
         try:
-            divy = _dividends(code)
+            div_rows = _div_rows(code)
         except Exception:
-            divy = pd.Series(dtype=float)
+            div_rows = pd.DataFrame()
+        divy = dividend_years(div_rows)
+    if divy is None:
+        divy = pd.Series(dtype=float)
+    sdiv = stock_dividend_years(div_rows) if div_rows is not None else pd.Series(dtype=float)
     val = (ins or {}).get("val") or {}
     dy = val.get("yield", np.nan)
     rev = (ins or {}).get("rev")
     foreign = (ins or {}).get("foreign")
+    if rs is None and want("minervini"):
+        rs = rs_table(mkt[0])
 
-    res = {
-        "buffett": buffett.evaluate(y, price, y10),
-        "graham": graham(y10, q, b, divy, price, fin),
-        "lynch": lynch(y, q, b, price, dy, rev, fin),
-        "oneil": oneil(y, q, hist, price, foreign, mkt[0], mkt[1], fin),
+    calc = {
+        "buffett": lambda: buffett.evaluate(y, price, y10),
+        "graham": lambda: graham(y10, q, b, divy, price, fin),
+        "lynch": lambda: lynch(y, q, b, price, dy, rev, fin),
+        "oneil": lambda: oneil(y, q, hist, price, foreign, mkt[0], mkt[1], fin),
+        "greenblatt": lambda: greenblatt(q, b, price, fin, industry(code) if want("greenblatt") else ""),
+        "piotroski": lambda: piotroski(y, b, sdiv, fin),
+        "minervini": lambda: minervini(code, hist, price, rs),
     }
+    res = {}
+    for k, fn in calc.items():
+        if not want(k):
+            continue
+        try:
+            res[k] = fn()
+        except Exception:          # 單一位大師算壞了，不要拖垮其他人
+            res[k] = None
+    if fin:      # 金融股：報表沒有的項目標成「金融股不適用」，不要寫「資料不足」
+        for k, secs in (("graham", ("財務狀況",)), ("lynch", ("負債", "存貨"))):
+            if res.get(k):
+                res[k]["na_secs"] = secs
     last_q = q.index[-1] if len(q) else None
     return res, last_q
 
@@ -514,86 +882,155 @@ def build_all(code, price, hist, ins, data=None, divy=None, mkt=(None, None)):
 # ------------------------------------------------------------
 
 # 選股頁顯示的短名稱
-SHORT = {"buffett": "巴菲特", "graham": "葛拉漢", "lynch": "林區", "oneil": "歐尼爾"}
+SHORT = {"buffett": "巴菲特", "graham": "葛拉漢", "lynch": "林區", "oneil": "歐尼爾",
+         "greenblatt": "葛林布萊特", "piotroski": "皮奧特洛斯基", "minervini": "米奈爾維尼"}
 
 MASTERS = [
-    ("buffett", "🎩 巴菲特", "好公司＋合理價"),
     ("graham", "📘 葛拉漢", "便宜＋財務安全"),
+    ("piotroski", "📊 皮奧特洛斯基", "便宜股裡挑體質轉好"),
+    ("buffett", "🎩 巴菲特", "好公司＋合理價"),
+    ("greenblatt", "🧮 葛林布萊特", "高資本報酬＋便宜"),
     ("lynch", "🔍 彼得・林區", "成長＋價格合理"),
     ("oneil", "🚀 歐尼爾", "成長＋動能"),
+    ("minervini", "📈 米奈爾維尼", "上升趨勢＋強勢"),
 ]
+NAME = {k: n for k, n, _ in MASTERS}
+
+# 光譜：從「只看便宜」到「只看趨勢」
+ZONES = [
+    ("deep", "深度價值", "買便宜、看財務安全", ["graham", "piotroski"]),
+    ("quality", "品質價值", "好生意，價格合理", ["buffett", "greenblatt"]),
+    ("garp", "合理價成長", "成長要看，價格也要看", ["lynch"]),
+    ("momentum", "成長動能", "盈餘加速、股價強勢", ["oneil", "minervini"]),
+]
+ZONE_OF = {k: z for z, _, _, ks in ZONES for k in ks}
+
+
+def score_of(r):
+    return r.get("score") if r else None
+
+
+def consensus(scores):
+    """區內共識：分數 list（None＝沒評）→ (平均, 文字)"""
+    have = [v for v in scores if v is not None]
+    if not have:
+        return None, "資料不足"
+    avg = round(sum(have) / len(have))
+    if len(have) == 1:
+        return avg, ("只有一位大師，" + ("看好" if avg >= 50 else "不看好"))
+    if all(v >= 50 for v in have):
+        txt = "都看好"
+    elif all(v < 50 for v in have):
+        txt = "都不看好"
+    else:
+        txt = "意見分歧"
+    if len(have) < len(scores):
+        txt += f"（{len(scores) - len(have)} 位沒評）"
+    return avg, txt
+
 
 CSS = """
 <style>
-.m-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; }
-.m-row + .m-row { border-top: 1px solid rgba(105,150,185,.12); }
-.m-name { width: 104px; flex: none; }
+.z-head { display: flex; align-items: baseline; gap: 8px; margin: 14px 0 2px; }
+.z-head:first-child { margin-top: 0; }
+.z-head b { color: #55cfff; font-size: 13px; letter-spacing: .5px; }
+.z-head span { color: #6f91ad; font-size: 11px; flex: 1; }
+.z-head em { font-style: normal; color: #edf7ff; font-size: 12px; white-space: nowrap; }
+.z-head em i { font-style: normal; color: #9db8cf; }
+.z-bar { height: 3px; border-radius: 99px; margin-bottom: 4px;
+         background: linear-gradient(90deg, #ffd166 0%, #4ee3d0 50%, #b48cff 100%); opacity: .35; }
+.m-row { display: flex; align-items: center; gap: 10px; padding: 8px 0 8px 10px;
+         border-left: 2px solid rgba(85,207,255,.25); }
+.m-name { width: 116px; flex: none; }
 .m-name b { color: #edf7ff; font-size: 14px; }
 .m-name div { color: #6f91ad; font-size: 11px; margin-top: 2px; }
 .m-track { flex: 1; height: 8px; border-radius: 99px; background: rgba(105,150,185,.18); overflow: hidden; }
 .m-fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, #0878bd, #4ee3d0); }
 .m-score { width: 30px; text-align: right; color: #fff; font-weight: 800; font-size: 18px; }
-.m-verdict { width: 58px; text-align: right; color: #9db8cf; font-size: 11px; }
+.m-verdict { width: 64px; text-align: right; color: #9db8cf; font-size: 11px; }
+@media (max-width: 520px) { .m-name { width: 96px; } .m-verdict { width: 52px; } }
 </style>
 """
 
 
+def _row(key, name, style, r):
+    sc = score_of(r)
+    if key == "lynch" and r and r.get("category"):
+        style = f"{style}｜{r['category']}"
+    if key == "piotroski" and r:
+        style = f"F-score {r['fscore']}／{r['n_signals']}"
+    if key == "minervini" and r:
+        style = f"趨勢樣板 {r['passed']}／8" + ("｜第二階段" if r.get("stage2") else "")
+    na = r and r.get("na") and sc is None
+    right = verdict(sc) if sc is not None else ("不適用" if na else "資料不足")
+    return (f'<div class="m-row"><div class="m-name"><b>{_e(name)}</b><div>{_e(style)}</div></div>'
+            f'<div class="m-track"><div class="m-fill" style="width:{sc or 0}%"></div></div>'
+            f'<div class="m-score">{sc if sc is not None else "—"}</div>'
+            f'<div class="m-verdict">{right}</div></div>')
+
+
 def render(code, price, hist, ins):
-    with st.spinner("四位大師讀財報中…"):
+    with st.spinner("七位大師讀財報中…"):
         res, last_q = build_all(code, price, hist, ins, mkt=market())
 
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown('<div class="ins-kicker" style="margin-top:22px">MASTERS</div>'
-                '<div class="ins-title">🧠 四位大師怎麼看</div>', unsafe_allow_html=True)
+                '<div class="ins-title">🧠 七位大師怎麼看</div>', unsafe_allow_html=True)
 
     if res is None:
         st.caption("抓不到足夠的年度財報（需要至少 3 個完整年度），或財報資料暫時無法連線。")
         return
 
-    rows, scored = [], {}
-    for key, name, style in MASTERS:
-        r = res.get(key)
-        sc = r["score"] if r else None
-        if key == "lynch" and r and r.get("category"):
-            style = f"{style}｜{r['category']}"
-        if sc is not None:
-            scored[name] = sc
-        rows.append(f'<div class="m-row"><div class="m-name"><b>{_e(name)}</b><div>{_e(style)}</div></div>'
-                    f'<div class="m-track"><div class="m-fill" style="width:{sc or 0}%"></div></div>'
-                    f'<div class="m-score">{sc if sc is not None else "—"}</div>'
-                    f'<div class="m-verdict">{verdict(sc) if sc is not None else "資料不足"}</div></div>')
+    meta = {k: (n, st_) for k, n, st_ in MASTERS}
+    rows, zone_avg = [], {}
+    for z, zname, zdesc, keys in ZONES:
+        avg, txt = consensus([score_of(res.get(k)) for k in keys])
+        if avg is not None:
+            zone_avg[zname] = avg
+        rows.append(f'<div class="z-head"><b>{_e(zname)}</b><span>{_e(zdesc)}</span>'
+                    f'<em>{avg if avg is not None else "—"} <i>{_e(txt)}</i></em></div>')
+        for k in keys:
+            n, style = meta[k]
+            rows.append(_row(k, n, style, res.get(k)))
 
     summary = ""
-    if len(scored) >= 2:
-        hi = max(scored, key=scored.get)
-        lo = min(scored, key=scored.get)
-        n_ok = sum(1 for v in scored.values() if v >= 50)
-        summary = (f"{len(scored)} 位中有 {n_ok} 位給到 50 分以上。"
-                   f"最喜歡這檔的是{hi.split(' ')[1]}（{scored[hi]}），最不喜歡的是{lo.split(' ')[1]}（{scored[lo]}）。")
+    if len(zone_avg) >= 2:
+        hi = max(zone_avg, key=zone_avg.get)
+        lo = min(zone_avg, key=zone_avg.get)
+        summary = (f"四個流派中，最看好這檔的是「{hi}」（區內平均 {zone_avg[hi]}），"
+                   f"最不看好的是「{lo}」（{zone_avg[lo]}）。")
     q_txt = f"財報最新到 {last_q.year} Q{(last_q.month - 1) // 3 + 1}。" if last_q is not None else ""
-    fin_txt = ("<br>金融股報表沒有毛利、流動資產這類項目，相關規則會略過，分數只用有資料的項目換算。"
-               if res["buffett"] and res["buffett"].get("is_fin") else "")
+    fin_txt = ("<br>金融股報表沒有毛利、流動資產這類項目，相關規則標成「金融股不適用」，分數只用適用的項目換算。"
+               if res.get("buffett") and res["buffett"].get("is_fin") else "")
     st.markdown(f"""
     <div class="ins-card">
+      <div class="z-bar"></div>
       {''.join(rows)}
-      <div class="ins-dates">{_e(summary)}<br>每位大師的原則寫成規則各自打分（0～100）。{_e(q_txt)}
+      <div class="ins-dates">{_e(summary)}<br>由上到下是投資光譜：越上面越重視「便宜」，越下面越重視「趨勢」。
+      每位大師的原則寫成規則各自打分（0～100），區內共識看同一流派的大師是否意見一致。{_e(q_txt)}
       這是公式化的參考，不代表他們本人會怎麼看，也不是買賣建議。{fin_txt}</div>
     </div>""", unsafe_allow_html=True)
 
     # 每一位的明細
     for key, name, _ in MASTERS:
         r = res.get(key)
-        title = f"{name}：{r['score']} 分｜每一分怎麼來的" if r else f"{name}：資料不足"
+        sc = score_of(r)
+        if sc is not None:
+            title = f"{name}：{sc} 分｜每一分怎麼來的"
+        elif r and r.get("na"):
+            title = f"{name}：不適用"
+        else:
+            title = f"{name}：資料不足"
         with st.expander(title):
-            if not r:
-                st.caption("這位大師需要的資料暫時抓不到。")
+            if sc is None:
+                st.caption(r["na"] if r and r.get("na") else "這位大師需要的資料暫時抓不到。")
                 continue
             if key == "buffett":
                 buffett.detail(r)
                 continue
             if r.get("cap_note"):
                 st.caption(f"⚠️ {r['cap_note']}（未設上限時是 {r['raw_score']} 分）")
-            buffett.rules_block(r["sections"])
+            buffett.rules_block(r["sections"], na=r.get("na_secs", ()))
             if key == "graham" and np.isfinite(r.get("graham_number", np.nan)):
                 gn = r["graham_number"]
                 st.caption(f"葛拉漢數字 √(22.5 × 近 3 年平均 EPS {r['avg3']:.2f} × 每股淨值 {r['bvps']:.2f}) "
@@ -610,3 +1047,15 @@ def render(code, price, hist, ins):
             if key == "oneil":
                 st.caption("CAN SLIM：C 當季盈餘、A 年度盈餘、N 新高、S 供需、L 領導股、I 法人認同、M 大盤方向。"
                            "歐尼爾也強調跌破買價 7～8% 就停損，這張卡只評選股條件。")
+            if key == "greenblatt":
+                st.caption("神奇公式本人的用法是：全市場（排除金融、公用事業）依「資本報酬率」與「盈餘殖利率」各排一次名，"
+                           "兩個名次相加最小的 20～30 檔一起買、持有一年再換。這裡沒有全市場排名，改用分段給分；"
+                           "EBIT 用近 4 季營業利益，淨營運資金扣掉現金與短期借款，固定資產用不動產廠房設備淨額。")
+            if key == "piotroski":
+                st.caption(f"F-score 用 {r['year']} 年報和前一年比，九個訊號各 1 分，分數＝符合數 ÷ 能評的訊號數。"
+                           "皮奧特洛斯基的原始研究是在「股價淨值比最低的 20%」價值股裡，用 F-score 8～9 分挑贏家、"
+                           "0～1 分避開輸家；高本益比的成長股拿高分，意義比較小。")
+            if key == "minervini":
+                st.caption("相對強度 RS：仿 IBD 算法，近一季漲幅權重 40%、前三季各 20%，再和全市場上市櫃股票比排名"
+                           "（用未還原股價，除權息會讓高配息股略為吃虧）。米奈爾維尼只買 8 條全中的股票，"
+                           "並且要再等出現波動收縮（VCP）的買點，這張卡只檢查趨勢樣板。")

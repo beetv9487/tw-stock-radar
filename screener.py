@@ -1,11 +1,12 @@
 # ============================================================
 # 🔎 選股功能
 #
-# 四個條件（每個都可以開關、調數字）：
+# 五個條件（每個都可以開關、調數字）：
 #   1. 外資連續買超
 #   2. K 線在 MA5／MA10／MA20 的糾結點
 #   3. 股價在上升趨勢（季線之上、均線往上）
 #   4. 營收成長、毛利為正、有賺錢
+#   5. 投資大師分數（可選幾位大師，或選一個流派要求區內每位都達標）
 #
 # 做法：先用「很快就能算完」的條件 1、4 刷掉大部分股票，
 #       剩下的才去 Yahoo 抓 K 線算條件 2、3，全市場也能在短時間內跑完。
@@ -401,7 +402,9 @@ def run_screen(opt, progress):
         rev = load_revenue()
         val_all, _ = insights._safe(insights.valuation_table, ({}, None))
         mkt = masters.market()
-        empty_div = pd.Series(dtype=float)
+        rs = masters.rs_table(mkt[0]) if "minervini" in chosen else None
+        if "minervini" in chosen and rs is None:
+            notes.append("抓不到全市場收盤價，米奈爾維尼的相對強度（RS）這次沒評，他的分數最多 70。")
         keep, nodata = {}, []
         for i, c in enumerate(codes):
             progress(0.8 + 0.2 * i / max(len(codes), 1), f"大師評分：{i + 1}/{len(codes)}（{c} {rows[c]['名稱']}）")
@@ -411,12 +414,11 @@ def run_screen(opt, progress):
                 nodata.append(c)
                 continue
             ins = {"foreign": fi.get(c), "rev": rev.get(c), "val": val_all.get(c)}
-            res, _ = masters.build_all(c, price, h, ins, mkt=mkt,
-                                       divy=None if "graham" in chosen else empty_div)
+            res, _ = masters.build_all(c, price, h, ins, mkt=mkt, rs=rs, need=set(chosen))
             if res is None:
                 nodata.append(c)
                 continue
-            scores = {k: (res[k]["score"] if res.get(k) else None) for k in chosen}
+            scores = {k: masters.score_of(res.get(k)) for k in chosen}
             hits = [s is not None and s >= min_sc for s in scores.values()]
             if not (all(hits) if need_all else any(hits)):
                 continue
@@ -424,17 +426,20 @@ def run_screen(opt, progress):
             for k, s in scores.items():
                 r[masters.SHORT[k]] = s
             have = [s for s in scores.values() if s is not None]
-            r["大師平均"] = round(sum(have) / len(have)) if have else None
+            r["區內平均" if opt.get("master_zone") else "大師平均"] = round(sum(have) / len(have)) if have else None
             keep[c] = r
         rows = keep
         names = "、".join(masters.SHORT[k] for k in chosen)
         rule = "都" if need_all or len(chosen) == 1 else "任一位"
-        steps.append((f"⑤ {names}{rule} ≥ {min_sc:.0f} 分", len(rows)))
+        zone = opt.get("master_zone")
+        steps.append((f"⑤ {zone + '區（' + names + '）' if zone else names}{rule} ≥ {min_sc:.0f} 分", len(rows)))
+        if "greenblatt" in chosen:
+            notes.append("葛林布萊特的神奇公式不適用金融股、公用事業，這兩類在他那一欄沒有分數。")
         if nodata:
             notes.append(f"有 {len(nodata)} 檔財報或股價資料不足（例如上市未滿 3 年，或 FinMind 暫時連不到），"
                          f"沒有評分：{'、'.join(nodata[:10])}{'…' if len(nodata) > 10 else ''}")
         notes.append("大師分數是把各自的選股原則寫成規則算出來的參考，詳細規則到個股分析頁展開看。")
-        sort_col = "大師平均"
+        sort_col = "區內平均" if opt.get("master_zone") else "大師平均"
 
     progress(1.0, "完成")
     df = pd.DataFrame(list(rows.values()))
@@ -468,14 +473,27 @@ def render(metric_html):
         rev_yoy = c2.number_input("營收年增 > (%)", -100.0, 500.0, 0.0, step=5.0, key="sc_rev")
         need_profit = c3.checkbox("淨利也要 > 0", value=True, key="sc_profit")
 
-        master_names = {"巴菲特": "buffett", "葛拉漢": "graham", "彼得・林區": "lynch", "歐尼爾": "oneil"}
+        import masters
         c1, c2 = st.columns([1.2, 2])
         use_master = c1.checkbox("⑤ 投資大師分數", value=False, key="sc_use_master")
-        picked = c2.multiselect("選大師（可複選）", list(master_names), default=["巴菲特"], key="sc_masters")
-        c1, c2, c3 = st.columns([1.2, 1, 1])
-        master_min = c2.number_input("分數 ≥", 0, 100, 60, step=5, key="sc_master_min")
-        master_mode = c3.radio("多位時", ["每位都要達到", "任一位達到"], key="sc_master_mode")
+        by = c2.radio("怎麼選", ["依流派（光譜分區）", "依大師"], horizontal=True, key="sc_master_by")
+        c1, c2 = st.columns([1.2, 2])
         c1.caption(f"要逐檔讀財報，最多評 {MAX_MASTER} 檔，會多花 1～2 分鐘。")
+        if by.startswith("依流派"):
+            zlabel = {f"{zn}（{'、'.join(masters.SHORT[k] for k in ks)}）": ks
+                      for _, zn, _, ks in masters.ZONES}
+            zpick = c2.selectbox("選一個流派：區內每位大師都要達到", list(zlabel), index=1, key="sc_zone")
+            chosen_keys, need_all, zone_name = zlabel[zpick], True, zpick.split("（")[0]
+            c1, c2, c3 = st.columns([1.2, 1, 1])
+            master_min = c2.number_input("分數 ≥", 0, 100, 60, step=5, key="sc_master_min")
+        else:
+            master_names = {masters.SHORT[k] if k != "lynch" else "彼得・林區": k for k, _, _ in masters.MASTERS}
+            picked = c2.multiselect("選大師（可複選）", list(master_names), default=["巴菲特"], key="sc_masters")
+            c1, c2, c3 = st.columns([1.2, 1, 1])
+            master_min = c2.number_input("分數 ≥", 0, 100, 60, step=5, key="sc_master_min")
+            master_mode = c3.radio("多位時", ["每位都要達到", "任一位達到"], key="sc_master_mode")
+            chosen_keys, need_all, zone_name = ([master_names[n] for n in picked],
+                                                master_mode == "每位都要達到", None)
 
         go = st.button("🔎 開始選股", key="sc_go")
 
@@ -484,8 +502,8 @@ def render(metric_html):
                    use_ma=use_ma, ma_tol=ma_tol, need_above=need_above,
                    use_trend=use_trend, use_fund=use_fund, rev_yoy=rev_yoy,
                    need_profit=need_profit, use_master=use_master,
-                   masters=[master_names[n] for n in picked], master_min=master_min,
-                   master_all=(master_mode == "每位都要達到"))
+                   masters=chosen_keys, master_min=master_min,
+                   master_all=need_all, master_zone=zone_name)
         bar = st.progress(0.0, "準備中…")
         try:
             df, steps, notes = run_screen(opt, lambda p, t: bar.progress(min(max(p, 0.0), 1.0), t))

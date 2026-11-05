@@ -51,7 +51,9 @@ def _token():
 
 def fetch_rows(dataset, code, start):
     """FinMind 原始資料（所有欄位）"""
-    params = {"dataset": dataset, "data_id": code, "start_date": start}
+    params = {"dataset": dataset, "start_date": start}
+    if code:
+        params["data_id"] = code
     headers = {}
     tok = _token()
     if tok:
@@ -409,18 +411,27 @@ def render(code, price):
         detail(b)
 
 
-def rules_block(secs):
-    """各項規則與得分（四位大師共用）"""
+FIN_NA = "金融股不適用"
+
+
+def rules_block(secs, na=()):
+    """各項規則與得分（大師共用）；na：這些項目沒有規則時寫「金融股不適用」而不是「資料不足」"""
     html_parts = []
     for k, (rules, w) in secs.items():
-        html_parts.append(f"<b style='color:#55cfff'>{_e(k)}（滿分 {w}）</b>" + _rules_html(rules) + "<br>")
+        if not rules and k in na:
+            body = f'<div class="rule">{FIN_NA}（金融業報表沒有這類項目，不列入計分）</div>'
+            head = f"<b style='color:#55cfff'>{_e(k)}</b>"
+        else:
+            body = _rules_html(rules)
+            head = f"<b style='color:#55cfff'>{_e(k)}（滿分 {w}）</b>"
+        html_parts.append(head + body + "<br>")
     st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 
 def detail(b):
     if b.get("cap_note"):
         st.caption("⚠️ " + b["cap_note"])
-    rules_block(b["sections"])
+    rules_block(b["sections"], na=("負債", "護城河", "現金流") if b.get("is_fin") else ())
 
     y = b["y"]
     tbl = pd.DataFrame({
